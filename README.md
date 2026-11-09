@@ -18,6 +18,28 @@
 - **开机自启**：Windows 任务计划/注册表、macOS LaunchAgent、Linux systemd 用户服务/XDG autostart。
 - **单文件可执行**：Rust 编译，无运行时依赖（SQLite 已内置）。
 
+## 自动编译（GitHub Actions）
+
+仓库内置两套工作流：
+
+- `.github/workflows/ci.yml`：每次 push / PR 在三平台执行测试和 release 构建，并上传构建产物。
+- `.github/workflows/release.yml`：手动运行或推送 `v*` 标签时构建三平台二进制；打标签时自动创建 GitHub Release 并附加安装包。
+
+推送到 GitHub 后，在 **Actions → 对应 workflow → Artifacts** 下载：
+
+- `sentinel-windows-x86_64`：Windows `sentinel.exe`
+- `sentinel-macos-*`：macOS 可执行文件
+- `sentinel-linux-x86_64`：Linux 可执行文件
+
+发布正式版本：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Windows 用户下载 `sentinel.exe` 后无需安装 Rust，直接运行即可。
+
 ## 快速开始
 
 ```bash
