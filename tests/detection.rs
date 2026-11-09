@@ -36,6 +36,11 @@ fn end_to_end_scan_dedupe_and_report() -> anyhow::Result<()> {
     config.scan.roots = vec![docs.clone()];
     config.scan.threads = 2;
     config.scan.full_scan_interval_hours = 0;
+    // tempfile uses %TEMP% on Windows, which is in the built-in exclude list;
+    // disable built-ins so this test can scan its own temporary fixture.
+    config.scan.use_default_excludes = false;
+    config.scan.exclude_globs.clear();
+    config.scan.exclude_extensions.clear();
     config.storage.database = dir.path().join("sentinel.db");
     config.storage.reports_dir = dir.path().join("reports");
     config.notify.enabled = false;
