@@ -79,6 +79,10 @@ fn overview(ctx: &AppContext) -> Response {
     };
     let runs = store.recent_runs(6).unwrap_or_default();
     let categories = store.category_counts().unwrap_or_default();
+    // Prefer the last scan run: files.last_scanned only moves when a file is
+    // actually re-analysed, so an all-unchanged incremental scan would leave
+    // the dashboard showing a stale timestamp.
+    let last_scan = runs.first().map(|run| run.finished_at).or(stats.last_scan);
 
     let by_severity = severity_map(&stats.by_severity);
     let mut category_items: Vec<Value> = categories
@@ -127,8 +131,8 @@ fn overview(ctx: &AppContext) -> Response {
             "findings": stats.findings,
             "unacknowledged": stats.unacknowledged,
             "by_severity": by_severity,
-            "last_scan": stats.last_scan,
-            "last_scan_text": stats.last_scan.map(format_ts),
+            "last_scan": last_scan,
+            "last_scan_text": last_scan.map(format_ts),
         },
         "categories": category_items,
         "runs": runs_json,

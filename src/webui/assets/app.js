@@ -543,6 +543,8 @@
   function lastScanCard(last) {
     var summary = last.summary || {};
     var counts = summary.new_by_severity || {};
+    var unchangedOnly =
+      Number(summary.files_scanned || 0) === 0 && Number(summary.files_unchanged || 0) > 0;
     var chips = SEV_ORDER.filter(function (key) {
       return Number(counts[key] || 0) > 0;
     })
@@ -559,6 +561,11 @@
       (last.duration_ms / 1000).toFixed(1) +
       ' s</span></div>' +
       '<div class="card-body">' +
+      (unchangedOnly
+        ? '<div class="hint-line" style="margin-bottom:12px">本次没有新增或修改的文件，' +
+          num(summary.files_unchanged) +
+          ' 个文件按 size + mtime 跳过。需要逐文件重新检测请使用「强制全量重扫」。</div>'
+        : '') +
       '<div class="stat-grid" style="gap:10px">' +
       statCard('分析文件', num(summary.files_scanned), '未变化 ' + num(summary.files_unchanged) + ' · 跳过 ' + num(summary.files_skipped), false) +
       statCard('命中总数', num(summary.findings), '新增 ' + num(summary.new_findings) + ' 处', false) +
