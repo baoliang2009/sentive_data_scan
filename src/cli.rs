@@ -24,6 +24,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// 打开本地图形控制台（浏览器界面）
+    Ui(UiArgs),
     /// 扫描目录（默认扫描配置中的常用目录）
     Scan(ScanArgs),
     /// 前台运行落盘监控 + 定时对账
@@ -47,6 +49,17 @@ pub enum Command {
     NotifyTest,
     /// 显示版本信息
     Version,
+}
+
+#[derive(Debug, Args)]
+pub struct UiArgs {
+    /// 监听端口；0 表示由系统分配，端口被占用时自动顺延
+    #[arg(long, default_value_t = 7419)]
+    pub port: u16,
+
+    /// 启动后不自动打开浏览器
+    #[arg(long)]
+    pub no_open: bool,
 }
 
 #[derive(Debug, Args)]

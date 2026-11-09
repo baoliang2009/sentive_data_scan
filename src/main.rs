@@ -52,6 +52,9 @@ fn run(cli: Cli) -> Result<()> {
             );
             Ok(())
         }
+        Command::Ui(args) => {
+            data_sentinel::webui::run(cli.config.clone(), args.port, !args.no_open)
+        }
         Command::Config(args) => handle_config(&config, &config_path, args.command),
         Command::Autostart(args) => handle_autostart(&config_path, args.command),
         Command::NotifyTest => Notifier::new(&config.notify).test(),

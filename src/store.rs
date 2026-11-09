@@ -82,6 +82,17 @@ pub struct StoreStats {
     pub last_scan: Option<i64>,
 }
 
+/// One row of `scan_runs`, used by the local console history list.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanRun {
+    pub id: i64,
+    pub started_at: i64,
+    pub finished_at: i64,
+    pub files_scanned: u64,
+    pub findings: u64,
+    pub new_findings: u64,
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -91,12 +102,7 @@ impl Store {
         if let Some(parent) = path.parent() {
             ensure_private_dir(parent)?;
         }
-        let conn =
-            Connection::open(path).with_context(|| format!("无法打开数据库 {}", path.display()))?;
-        conn.busy_timeout(Duration::from_secs(10))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY;",
-        )?;
+        let conn = open_connection(path)?;
         Self::initialize(conn, path)
     }
 
@@ -407,6 +413,45 @@ impl Store {
         Ok(())
     }
 
+    /// Most recent scan batches, newest first.
+    pub fn recent_runs(&self, limit: usize) -> Result<Vec<ScanRun>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, started_at, finished_at, files_scanned, findings, new_findings
+             FROM scan_runs ORDER BY finished_at DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit.max(1) as i64], |row| {
+            Ok(ScanRun {
+                id: row.get(0)?,
+                started_at: row.get(1)?,
+                finished_at: row.get(2)?,
+                files_scanned: row.get::<_, i64>(3)?.max(0) as u64,
+                findings: row.get::<_, i64>(4)?.max(0) as u64,
+                new_findings: row.get::<_, i64>(5)?.max(0) as u64,
+            })
+        })?;
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(row?);
+        }
+        Ok(runs)
+    }
+
+    /// Finding counts grouped by rule category.
+    pub fn category_counts(&self) -> Result<BTreeMap<String, u64>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare("SELECT category, COUNT(*) FROM findings GROUP BY category")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut counts = BTreeMap::new();
+        for row in rows {
+            let (category, count) = row?;
+            counts.insert(category, count.max(0) as u64);
+        }
+        Ok(counts)
+    }
+
     pub fn prune(&self, retention_days: u64) -> Result<usize> {
         if retention_days == 0 {
             return Ok(0);
@@ -423,6 +468,45 @@ impl Store {
         )?;
         Ok(removed)
     }
+}
+
+/// Open a connection and apply pragmas.
+///
+/// Several processes (the CLI, the daemon and the local console) may hold the
+/// same database open. Switching `journal_mode` needs a brief exclusive lock,
+/// so a concurrent writer makes it fail with `SQLITE_BUSY` even though the file
+/// is already in WAL mode. We therefore only touch the mode when it differs and
+/// retry a few times before giving up.
+fn open_connection(path: &Path) -> Result<Connection> {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let result = Connection::open(path)
+            .with_context(|| format!("无法打开数据库 {}", path.display()))
+            .and_then(|conn| {
+                conn.busy_timeout(Duration::from_secs(10))?;
+                configure(&conn).map(|()| conn)
+            });
+        match result {
+            Ok(conn) => return Ok(conn),
+            Err(error) if attempt < 4 => {
+                tracing::debug!(attempt, error = %error, "数据库暂时被占用，稍后重试");
+                std::thread::sleep(Duration::from_millis(120 * u64::from(attempt)));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn configure(conn: &Connection) -> Result<()> {
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap_or_default();
+    if !mode.eq_ignore_ascii_case("wal") {
+        conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))?;
+    }
+    conn.execute_batch("PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY;")?;
+    Ok(())
 }
 
 fn map_finding(row: &Row<'_>) -> rusqlite::Result<StoredFinding> {

@@ -14,6 +14,7 @@
 - **高精度**：身份证校验位/出生日期、银行卡 Luhn、熵值、占位符过滤、关键词上下文、跨块去重。
 - **Office 抽取**：直接扫描 `.docx/.xlsx/.pptx` 内部文本。
 - **脱敏存储**：只保存 `110105********002X` 这类脱敏值、行号、上下文和哈希；支持 HTML/JSON 报告。
+- **本地控制台**：`sentinel ui` 启动图形界面（概览 / 命中记录 / 检测规则 / 设置），带实时扫描进度、筛选搜索、批量确认与报告导出；仅监听 `127.0.0.1`，三平台统一用系统浏览器打开。
 - **桌面通知**：Windows Toast、macOS 通知中心、Linux/Kylin `notify-send`，并有降级通道。
 - **开机自启**：Windows 任务计划/注册表、macOS LaunchAgent、Linux systemd 用户服务/XDG autostart。
 - **单文件可执行**：Rust 编译，无运行时依赖（SQLite 已内置）。
@@ -49,6 +50,9 @@ cargo build --release
 # 首次运行会生成默认配置
 ./target/release/sentinel config path
 
+# 打开图形控制台（自动用系统默认浏览器）
+./target/release/sentinel ui
+
 # 手动扫描默认目录
 ./target/release/sentinel scan
 
@@ -77,6 +81,7 @@ cargo build --release
 
 | 命令 | 说明 |
 |---|---|
+| `sentinel ui [--port 7419] [--no-open]` | 启动本地图形控制台（浏览器界面） |
 | `sentinel scan [--path ...] [--force] [--no-notify] [--json]` | 扫描目录，输出统计 |
 | `sentinel watch` / `sentinel daemon` | 落盘监控 + 启动对账 + 定时对账 |
 | `sentinel findings [--severity high] [--all] [--json]` | 查看命中记录 |
@@ -88,6 +93,28 @@ cargo build --release
 | `sentinel config path\|show\|init [--force]` | 配置操作 |
 | `sentinel autostart install\|uninstall\|status` | 开机自启管理 |
 | `sentinel notify-test` | 桌面通知链路测试 |
+
+## 图形控制台
+
+```bash
+sentinel ui                 # 打开 http://127.0.0.1:7419/
+sentinel ui --port 8080     # 指定端口（被占用时自动顺延）
+sentinel ui --no-open       # 只启动服务，不打开浏览器
+```
+
+| 页面 | 内容 |
+|---|---|
+| 概览 | 未确认 / 严重高危计数、级别与分类分布、最近命中、扫描历史、上次扫描结果 |
+| 命中记录 | 按级别、状态、类型筛选，关键词搜索，批量确认，右侧详情含脱敏值、上下文与文件定位 |
+| 检测规则 | 内置规则逐条开关，在线测试文本（结果同样只显示脱敏值） |
+| 设置 | 扫描目录、大小上限、线程数、通知策略、保留天数、开机自启、直接编辑 `config.toml` |
+
+设计取舍：
+
+- **不引入 WebView / Tauri**：界面由同一个二进制内置提供，三平台都用系统自带浏览器打开。麒麟上无需安装 WebKitGTK，产物仍是单文件可执行，CI 三平台构建流程不变。
+- **只监听回环地址**：绑定 `127.0.0.1`，并用随机会话令牌校验 `X-Sentinel-Token`，其他网页无法驱动本机接口。
+- **改配置保留注释**：开关规则、修改设置只就地改写对应键值，不会冲掉 `config.toml` 里的注释；写入前备份为 `config.toml.bak`。
+- **控制台不替代守护进程**：它是查看与操作入口；需要落盘实时监控仍用 `sentinel daemon`，或在设置页安装开机自启。
 
 ## 配置
 
@@ -148,6 +175,8 @@ validator = "none"
 - `keywords` 要求命中附近出现任一关键词，用于降低误报。
 
 ## 平台说明
+
+三种平台的控制台都用系统默认浏览器打开（Windows 默认浏览器 / macOS Safari / 麒麟自带浏览器），不需要额外安装运行时。
 
 ### Windows
 

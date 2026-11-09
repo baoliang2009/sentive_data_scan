@@ -17,6 +17,59 @@ use crate::rules::RuleSet;
 use crate::store::{FileState, Store};
 use crate::util::{effective_threads, path_to_key};
 
+/// Shared, lock-free counters used by the local console to render live progress.
+#[derive(Debug, Default)]
+pub struct ScanProgress {
+    files_seen: AtomicU64,
+    files_scanned: AtomicU64,
+    findings: AtomicU64,
+    finished: AtomicBool,
+}
+
+impl ScanProgress {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn reset(&self) {
+        self.files_seen.store(0, Ordering::Relaxed);
+        self.files_scanned.store(0, Ordering::Relaxed);
+        self.findings.store(0, Ordering::Relaxed);
+        self.finished.store(false, Ordering::Relaxed);
+    }
+
+    pub fn files_seen(&self) -> u64 {
+        self.files_seen.load(Ordering::Relaxed)
+    }
+
+    pub fn files_scanned(&self) -> u64 {
+        self.files_scanned.load(Ordering::Relaxed)
+    }
+
+    pub fn findings(&self) -> u64 {
+        self.findings.load(Ordering::Relaxed)
+    }
+
+    pub fn finished(&self) -> bool {
+        self.finished.load(Ordering::Relaxed)
+    }
+
+    pub fn mark_finished(&self) {
+        self.finished.store(true, Ordering::Relaxed);
+    }
+
+    fn bump_seen(&self) {
+        self.files_seen.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn bump_scanned(&self, findings: u64) {
+        self.files_scanned.fetch_add(1, Ordering::Relaxed);
+        if findings > 0 {
+            self.findings.fetch_add(findings, Ordering::Relaxed);
+        }
+    }
+}
+
 pub struct Scanner {
     pub config: Arc<Config>,
     pub store: Arc<Store>,
@@ -26,6 +79,7 @@ pub struct Scanner {
     rules_fingerprint: String,
     rules_dirty: AtomicBool,
     large_file_lock: Mutex<()>,
+    progress: Option<Arc<ScanProgress>>,
 }
 
 impl Scanner {
@@ -59,7 +113,13 @@ impl Scanner {
             rules_fingerprint,
             rules_dirty: AtomicBool::new(rules_dirty),
             large_file_lock: Mutex::new(()),
+            progress: None,
         })
+    }
+
+    /// Attach live progress counters (used by the local web console).
+    pub fn set_progress(&mut self, progress: Arc<ScanProgress>) {
+        self.progress = Some(progress);
     }
 
     pub fn rules_changed(&self) -> bool {
@@ -219,6 +279,9 @@ impl Scanner {
         stats: &ScanStats,
     ) {
         stats.files_seen.fetch_add(1, Ordering::Relaxed);
+        if let Some(progress) = &self.progress {
+            progress.bump_seen();
+        }
 
         let metadata = match std::fs::metadata(path) {
             Ok(metadata) => metadata,
@@ -290,6 +353,9 @@ impl Scanner {
                         stats
                             .findings
                             .fetch_add(outcome.findings, Ordering::Relaxed);
+                        if let Some(progress) = &self.progress {
+                            progress.bump_scanned(outcome.findings);
+                        }
                         stats
                             .new_findings
                             .fetch_add(outcome.new_findings, Ordering::Relaxed);

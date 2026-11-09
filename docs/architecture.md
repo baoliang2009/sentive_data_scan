@@ -42,7 +42,7 @@
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │                          sentinel CLI                            │
-│  scan / watch(daemon) / findings / report / ack / rules /        │
+│  ui / scan / watch(daemon) / findings / report / ack / rules /   │
 │  config / autostart / notify-test                                │
 └───────────────┬──────────────────────────────────────────────────┘
                 │
@@ -95,11 +95,31 @@ data-sentinel/
 │   ├── notify.rs                # 三平台桌面通知
 │   ├── autostart.rs             # 三平台开机自启
 │   ├── report.rs                # HTML / JSON 报告
+│   ├── webui/                   # 本地图形控制台（sentinel ui）
+│   │   ├── mod.rs               # 回环监听、会话令牌、浏览器/文件管理器调用
+│   │   ├── server.rs            # 极简 HTTP/1.1 + 静态资源内嵌
+│   │   ├── api.rs               # JSON 接口：概览/命中/规则/扫描/设置
+│   │   ├── tomlpatch.rs         # 保留注释的 config.toml 就地改写
+│   │   └── assets/              # index.html + app.css + app.js（无构建步骤）
 │   └── util.rs                  # 路径、脱敏、哈希、HTML 转义
 └── tests/detection.rs
 ```
 
-模块之间只通过 `Config`、`Finding`、`Store` 等少量类型耦合，后续可替换检测引擎或增加 GUI 而不影响核心。
+模块之间只通过 `Config`、`Finding`、`Store` 等少量类型耦合，后续可替换检测引擎或再套一层原生壳而不影响核心。
+
+### 2.2 本地控制台
+
+`sentinel ui` 在 `127.0.0.1` 上起一个单用户 HTTP 服务，并用系统默认浏览器打开。
+界面资源在编译期内嵌（`include_str!`），不需要 Node 构建链，也不需要 WebView 运行时，
+因此 Windows / 麒麟 / macOS 三平台产物仍是单文件可执行。
+
+| 关注点 | 做法 |
+|---|---|
+| 攻击面 | 仅绑定回环地址；所有 `/api/*` 校验 `X-Sentinel-Token`，令牌随机生成后注入首页 |
+| 并发 | 请求线程池 + 共享只读 `Store` 连接；扫描线程使用独立连接，WAL 下一写多读 |
+| 实时进度 | `ScanProgress` 原子计数，前端轮询 `/api/scan/status`，避免长连接与 SSE |
+| 配置写入 | 只就地改写目标键值，保留 `config.toml` 注释；校验通过后落盘并备份 `.bak` |
+| 隐私 | 界面与接口只暴露脱敏值；不新增任何外发通道 |
 
 ---
 

@@ -19,3 +19,4 @@ pub mod scan;
 pub mod store;
 pub mod util;
 pub mod watch;
+pub mod webui;
