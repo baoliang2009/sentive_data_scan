@@ -131,11 +131,13 @@ fn send_desktop(
     #[cfg(target_os = "windows")]
     {
         let _ = sound;
+        let _ = macos_mode;
         send_windows(&title, &body, severity)
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let _ = sound;
+        let _ = macos_mode;
         send_linux(&title, &body, severity)
     }
 }
