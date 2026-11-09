@@ -1,0 +1,8 @@
+/target/
+**/*.rs.bk
+.DS_Store
+*.log
+*.db
+*.db-wal
+*.db-shm
+.env

@@ -1,0 +1,134 @@
+# 数据哨兵 DataSentinel 配置文件
+# 修改后重启守护进程生效。路径支持 ~、$HOME；相对路径相对于本文件所在目录。
+
+[general]
+language = "zh-CN"
+# trace / debug / info / warn / error
+log_level = "info"
+
+[scan]
+# 为空时自动扫描系统常用目录：
+#   Windows: 桌面 / 文档 / 下载
+#   macOS:   ~/Desktop, ~/Documents, ~/Downloads
+#   麒麟/Linux: 读取 XDG user-dirs（支持“桌面/文档/下载”等中文目录名）
+# 也可以显式列出多个目录，例如：
+# roots = ["~/Desktop", "~/Documents", "~/work"]
+roots = []
+
+# 可信路径（glob），命中的文件永不扫描，例如测试数据目录。
+allow_globs = []
+
+# 追加排除目录（默认同时启用内置排除项；见下方 use_default_excludes）。
+exclude_globs = []
+
+# 是否启用内置排除项（缓存/VCS/回收站/图片/音视频/压缩包/可执行文件等）。
+# 设为 false 后只使用本文件中的 exclude_globs / exclude_extensions。
+use_default_excludes = true
+
+# 为空表示自动识别文本与 Office 文档；设置后只扫描列出的扩展名。
+include_extensions = []
+
+# 追加跳过的扩展名（内置跳过图片/音视频/压缩包/可执行文件等）。
+exclude_extensions = []
+
+# 单文件大小上限（MB），超过则跳过并记录日志。
+max_file_size_mb = 64
+
+# 0 = 自动（CPU 核数，最多 8）；机械硬盘建议 2-4，SSD 可调高。
+threads = 0
+
+# 守护进程/开机自启后先做一次对账扫描。
+scan_on_startup = true
+
+# 定时全量对账间隔（小时）；0 = 关闭。只重新读取有变化的文件。
+full_scan_interval_hours = 24
+
+follow_symlinks = false
+skip_hidden = false
+
+# 抽取 .docx / .xlsx / .pptx 内的文本。
+office_documents = true
+
+# 分块大小（KB），用于大文件流式检测。
+chunk_kb = 1024
+
+# 命中上下文片段长度（字符数）。
+context_chars = 160
+
+[watch]
+# 监听文件创建/修改/重命名，实现落盘即扫描。
+enabled = true
+
+# 为空表示复用 scan.roots。
+roots = []
+
+# 事件去抖时间（毫秒），等待写入完成。
+debounce_ms = 2000
+
+# 忽略 .tmp/.part/.swp/~$ 等临时文件。
+ignore_temp_files = true
+
+# 待扫描队列上限，超过后立即冲刷，避免内存膨胀。
+max_pending = 20000
+
+[notify]
+enabled = true
+
+# info / low / medium / high / critical
+min_severity = "medium"
+
+# summary = 每批聚合一次；per_file = 每个示例一次（有上限）；off = 不弹窗
+mode = "summary"
+
+# macOS 通知声音（其他平台由桌面环境决定）。
+sound = true
+
+# macOS 弹窗方式：
+#   auto         = 中危及以上的命中使用系统对话框（不受专注模式影响），低危用通知中心
+#   alert        = 始终使用系统对话框
+#   notification = 仅使用通知中心（可能受“专注模式/勿扰”影响）
+macos_mode = "auto"
+
+# per_file 模式下单批最多通知数量。
+max_per_batch = 5
+
+[storage]
+# 为空 = 平台数据目录：
+#   Windows: %LOCALAPPDATA%\DataSentinel\sentinel.db
+#   macOS:   ~/Library/Application Support/DataSentinel/sentinel.db
+#   麒麟/Linux: ~/.local/share/DataSentinel/sentinel.db
+database = ""
+
+# 为空 = 平台数据目录/reports
+reports_dir = ""
+
+# 默认只保存脱敏值；设为 true 会保存命中原文（不推荐）。
+store_raw_match = false
+
+# 发现记录保留天数；0 = 永久保留。
+retention_days = 180
+
+[rules]
+# 关闭不需要的内置规则，例如 ["cn_landline", "email"]
+disabled = []
+
+# 低于该级别的命中不记录、不提醒。
+min_severity = "low"
+
+# 自定义规则示例（取消注释即可使用）：
+# [[rules.custom]]
+# id = "employee_id"
+# name = "员工工号"
+# category = "internal"
+# severity = "medium"
+# pattern = 'EMP-\d{6}'
+# keywords = ["员工", "工号"]
+# validator = "none"
+# description = "公司内部员工编号"
+# context_chars = 160
+#
+# 说明：
+# - pattern 使用 Rust regex 语法（不支持 lookaround）。
+# - 第一个捕获组视为敏感值；没有捕获组时使用整段匹配。
+# - validator 支持：none, luhn, cn_id, cn_id_15, phone, placeholder, entropy:3.2
+#   多个校验器用逗号分隔，例如 "entropy:3.5,placeholder"。
