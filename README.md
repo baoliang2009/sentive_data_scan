@@ -32,11 +32,11 @@
 - `sentinel-macos-*`：macOS 可执行文件
 - `sentinel-linux-x86_64`：Linux 可执行文件
 
-发布正式版本：
+发布正式版本（自动构建三平台二进制并生成 GitHub Release）：
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 Windows 用户下载 `sentinel.exe` 后无需安装 Rust，直接运行即可。
