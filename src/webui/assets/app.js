@@ -360,13 +360,17 @@
     if (!overview) return;
     var watch = $('#chip-watch');
     var autostart = $('#chip-autostart');
-    watch.className = 'chip ' + (overview.watch.enabled ? 'on' : 'off');
-    watch.querySelector('span:last-child').textContent = overview.watch.enabled
-      ? '落盘监控已启用'
-      : '落盘监控已关闭';
-    watch.title = overview.watch.enabled
-      ? '守护进程（sentinel daemon）运行时实时监听文件落盘'
-      : '可在配置中开启 watch.enabled';
+    var watchRunning = overview.watch.running;
+    if (watchRunning === undefined) watchRunning = overview.watch.enabled;
+    watch.className = 'chip ' + (watchRunning ? 'on' : 'off');
+    watch.querySelector('span:last-child').textContent = watchRunning
+      ? '落盘监控运行中'
+      : '落盘监控未运行';
+    watch.title = watchRunning
+      ? '本进程正在监听扫描目录，文件落盘后会立即检测并提醒'
+      : overview.watch.enabled
+        ? '配置已开启，但本进程没有运行监控：请用 sentinel ui（不带 --no-watch）或启动 sentinel daemon'
+        : '可在配置中开启 watch.enabled';
     autostart.className = 'chip ' + (overview.autostart.installed ? 'on' : 'off');
     autostart.querySelector('span:last-child').textContent = overview.autostart.installed
       ? '开机自启已安装'

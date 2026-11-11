@@ -22,7 +22,24 @@ pub fn run(config: Arc<Config>, scanner: Arc<Scanner>, notifier: Notifier) -> Re
     }) {
         tracing::warn!(error = %error, "注册 Ctrl-C 处理器失败");
     }
+    run_loop(config, scanner, notifier, running)
+}
 
+/// Run the watcher loop without installing a Ctrl-C handler.
+///
+/// Used when the watcher is embedded in a longer-lived foreground process such
+/// as `sentinel ui`: the console keeps the default SIGINT behaviour, so Ctrl-C
+/// still terminates the whole process instead of only stopping the watcher.
+pub fn run_detached(config: Arc<Config>, scanner: Arc<Scanner>, notifier: Notifier) -> Result<()> {
+    run_loop(config, scanner, notifier, Arc::new(AtomicBool::new(true)))
+}
+
+fn run_loop(
+    config: Arc<Config>,
+    scanner: Arc<Scanner>,
+    notifier: Notifier,
+    running: Arc<AtomicBool>,
+) -> Result<()> {
     let scan_roots = config.effective_roots();
     let watch_roots: Vec<PathBuf> = config
         .watch_roots()

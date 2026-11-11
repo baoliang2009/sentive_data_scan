@@ -34,6 +34,9 @@ pub struct AppContext {
     /// One shared read connection for every request: opening a fresh handle on
     /// each API call competes with the scanner for the WAL lock.
     store_cache: Mutex<Option<(PathBuf, Arc<crate::store::Store>)>>,
+    /// Whether this process is running the filesystem watcher. The config only
+    /// says it is allowed to; the console must not claim "监控中" otherwise.
+    watch_active: bool,
 }
 
 impl AppContext {
@@ -118,7 +121,12 @@ pub struct ScanResult {
     pub summary: serde_json::Value,
 }
 
-pub fn run(config_path: Option<PathBuf>, port: u16, open_browser: bool) -> Result<()> {
+pub fn run(
+    config_path: Option<PathBuf>,
+    port: u16,
+    open_browser: bool,
+    watch_active: bool,
+) -> Result<()> {
     let (_config, path) = Config::load(config_path.as_deref())?;
     let listener = bind(port)?;
     let address = listener.local_addr().context("无法获取监听地址")?;
@@ -129,11 +137,17 @@ pub fn run(config_path: Option<PathBuf>, port: u16, open_browser: bool) -> Resul
         started_at: now_ts(),
         autostart_cache: Mutex::new(None),
         store_cache: Mutex::new(None),
+        watch_active,
     });
 
     let url = format!("http://127.0.0.1:{}/", address.port());
     println!("数据哨兵控制台已启动：{url}");
     println!("  配置文件：{}", context.config_path.display());
+    if watch_active {
+        println!("  落盘监控：已启用（文件落到扫描目录会立即检测并提醒）");
+    } else {
+        println!("  落盘监控：未启用（只能手动扫描，或运行 sentinel daemon）");
+    }
     println!("  仅监听本机回环地址；按 Ctrl+C 结束。");
 
     if open_browser {

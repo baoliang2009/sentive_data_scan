@@ -14,7 +14,7 @@
 - **高精度**：身份证校验位/出生日期、银行卡 Luhn、熵值、占位符过滤、关键词上下文、跨块去重。
 - **Office 抽取**：直接扫描 `.docx/.xlsx/.pptx` 内部文本。
 - **脱敏存储**：只保存 `110105********002X` 这类脱敏值、行号、上下文和哈希；支持 HTML/JSON 报告。
-- **本地控制台**：`sentinel ui` 启动图形界面（概览 / 命中记录 / 检测规则 / 设置），带实时扫描进度、筛选搜索、批量确认与报告导出；仅监听 `127.0.0.1`，三平台统一用系统浏览器打开。
+- **本地控制台**：`sentinel ui` 启动图形界面（概览 / 命中记录 / 检测规则 / 设置），带实时扫描进度、筛选搜索、批量确认与报告导出；仅监听 `127.0.0.1`，三平台统一用系统浏览器打开。控制台进程默认自带落盘监控，文件落到扫描目录会立即检测并提醒（`--no-watch` 可关闭）。
 - **桌面通知**：Windows Toast、macOS 通知中心、Linux/Kylin `notify-send`，并有降级通道。
 - **开机自启**：Windows 任务计划/注册表、macOS LaunchAgent、Linux systemd 用户服务/XDG autostart。
 - **单文件可执行**：Rust 编译，无运行时依赖（SQLite 已内置）。
@@ -81,7 +81,7 @@ cargo build --release
 
 | 命令 | 说明 |
 |---|---|
-| `sentinel ui [--port 7419] [--no-open]` | 启动本地图形控制台（浏览器界面） |
+| `sentinel ui [--port 7419] [--no-open] [--no-watch]` | 启动本地图形控制台（浏览器界面），默认同时运行落盘监控 |
 | `sentinel scan [--path ...] [--force] [--no-notify] [--json]` | 扫描目录，输出统计 |
 | `sentinel watch` / `sentinel daemon` | 落盘监控 + 启动对账 + 定时对账 |
 | `sentinel findings [--severity high] [--all] [--json]` | 查看命中记录 |
@@ -97,10 +97,13 @@ cargo build --release
 ## 图形控制台
 
 ```bash
-sentinel ui                 # 打开 http://127.0.0.1:7419/
+sentinel ui                 # 打开 http://127.0.0.1:7419/，同时启用落盘监控
 sentinel ui --port 8080     # 指定端口（被占用时自动顺延）
 sentinel ui --no-open       # 只启动服务，不打开浏览器
+sentinel ui --no-watch      # 只提供控制台，不监听落盘（需要手动扫描或另跑 daemon）
 ```
+
+> 控制台启动时会在后台线程里运行与 `sentinel watch` 相同的监控逻辑（启动对账 + 落盘监听 + 定时对账），所以不必再单独开一个 `daemon`；顶部「落盘监控运行中」指示灯反映的是真实运行状态。
 
 | 页面 | 内容 |
 |---|---|

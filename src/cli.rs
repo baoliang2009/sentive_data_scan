@@ -60,6 +60,10 @@ pub struct UiArgs {
     /// 启动后不自动打开浏览器
     #[arg(long)]
     pub no_open: bool,
+
+    /// 不启动后台落盘监控（默认随控制台一起运行，落盘即提醒）
+    #[arg(long)]
+    pub no_watch: bool,
 }
 
 #[derive(Debug, Args)]

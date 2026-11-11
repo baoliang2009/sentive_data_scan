@@ -57,6 +57,9 @@ cargo build --release --locked
 # 前台运行落盘监控 + 定时对账
 .\target\release\sentinel.exe daemon
 
+# 图形控制台（默认同时运行落盘监控，等价于 ui + daemon）
+.\target\release\sentinel.exe ui
+
 # 查看命中、导出报告
 .\target\release\sentinel.exe findings --limit 30
 .\target\release\sentinel.exe report --format html --days 30

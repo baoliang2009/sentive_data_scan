@@ -142,6 +142,7 @@ fn overview(ctx: &AppContext) -> Response {
         },
         "watch": {
             "enabled": config.watch.enabled,
+            "running": ctx.watch_active,
             "interval_hours": config.scan.full_scan_interval_hours,
             "debounce_ms": config.watch.debounce_ms,
         },

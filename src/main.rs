@@ -53,7 +53,23 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Ui(args) => {
-            data_sentinel::webui::run(cli.config.clone(), args.port, !args.no_open)
+            let watch_active = if args.no_watch {
+                tracing::info!("已通过 --no-watch 关闭后台落盘监控");
+                false
+            } else if !config.watch.enabled {
+                tracing::info!("配置 watch.enabled = false，控制台不会监听落盘变更");
+                false
+            } else {
+                match start_background_watch(&config) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "后台落盘监控启动失败，控制台仍可手动扫描");
+                        eprintln!("落盘监控启动失败：{error:#}");
+                        false
+                    }
+                }
+            };
+            data_sentinel::webui::run(cli.config.clone(), args.port, !args.no_open, watch_active)
         }
         Command::Config(args) => handle_config(&config, &config_path, args.command),
         Command::Autostart(args) => handle_autostart(&config_path, args.command),
@@ -148,6 +164,27 @@ fn open_store(config: &Config) -> Result<Arc<Store>> {
         }
     }
     Ok(store)
+}
+
+/// Spawn the filesystem watcher in a background thread so `sentinel ui` doubles
+/// as a resident monitor: files that land in the scanned directories are
+/// detected (and notified) without a separate `sentinel daemon` process.
+fn start_background_watch(config: &Config) -> Result<()> {
+    let config = Arc::new(config.clone());
+    let store = open_store(&config)?;
+    let rules = RuleSet::build(&config.rules)?;
+    let scanner = Arc::new(Scanner::new(Arc::clone(&config), store, rules)?);
+    let notifier = Notifier::new(&config.notify);
+
+    std::thread::Builder::new()
+        .name("sentinel-watch".into())
+        .spawn(move || {
+            if let Err(error) = watch::run_detached(config, scanner, notifier) {
+                tracing::error!(error = %error, "后台落盘监控退出");
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 fn load_findings(store: &Store, args: &FindingsArgs) -> Result<Vec<StoredFinding>> {
