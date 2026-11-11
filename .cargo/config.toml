@@ -1,0 +1,17 @@
+# 静态链接 MSVC C 运行库。
+#
+# 默认情况下，rustc 在 Windows 上动态链接 VCRUNTIME140.dll。干净安装的
+# Windows（以及部分精简版系统）并没有安装“Microsoft Visual C++ 运行库”，
+# 直接双击 sentinel.exe 时会弹出：
+#
+#   无法启动此程序，因为计算机中丢失 VCRUNTIME140.dll。尝试重新安装该程序以解决此问题。
+#
+# 开启 crt-static 后，VC 运行库（以及 UCRT 转发 DLL）会被打包进单个 exe，
+# 目标机器无需再安装 Visual C++ Redistributable，符合“单文件可执行”的定位。
+# 这里的 rustflags 也会传给 cc/rusqlite 的构建脚本，SQLite 会使用同样的
+# /MT 编译选项，不会出现 CRT 混用。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

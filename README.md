@@ -191,7 +191,8 @@ powershell -ExecutionPolicy Bypass -File .\build-windows.ps1
 前提是已安装 Rust 和 Visual Studio Build Tools（“使用 C++ 的桌面开发”）。
 
 - 使用 MSVC 工具链：安装 Visual Studio Build Tools 后 `rustup target add x86_64-pc-windows-msvc`。
-- Toast 通过 PowerShell + WinRT 发送；极端情况下回退 `msg`。
+- VC 运行库已静态链接（`.cargo/config.toml` 开启 `+crt-static`），目标机器无需安装 Visual C++ Redistributable。
+- Toast 通过 PowerShell + WinRT 发送（`-EncodedCommand`，不落地临时脚本，不受脚本执行策略影响）；极端情况下回退 `msg`。
 - 自启优先写入任务计划（登录后延迟 30 秒），失败回退 `HKCU\...\Run`。
 - 任务计划以控制台程序启动时可能闪现一次窗口；后续可替换为托盘程序或 `windows_subsystem` 包装器。
 

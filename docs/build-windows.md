@@ -77,7 +77,7 @@ Windows 下：
 
 ### 5. 可选：打包成单文件分发
 
-MSVC release 产物已经是单个 `sentinel.exe`，SQLite 已静态内置。直接复制这个 exe 到其他 Windows 机器即可，无需安装 Rust。
+MSVC release 产物已经是单个 `sentinel.exe`，SQLite 与 VC 运行库都已静态内置（仓库里的 `.cargo/config.toml` 为 Windows MSVC 目标开启了 `+crt-static`）。直接复制这个 exe 到其他 Windows 机器即可，无需安装 Rust，也无需安装 Visual C++ Redistributable。
 
 如果希望双击启动或隐藏控制台窗口，可以使用任务计划程序启动 `sentinel.exe daemon`；当前版本由控制台程序启动时可能闪现一次窗口。
 
@@ -131,18 +131,29 @@ x86_64-w64-mingw32-objdump -p target/x86_64-pc-windows-gnu/release/sentinel.exe 
 
 ### 运行时报缺少 DLL
 
-使用 MSVC 工具链通常不会缺少 VC 运行库（目标机器可能需要安装 Microsoft Visual C++ Redistributable）。如果使用 GNU 交叉编译，按上面的 DLL 检查结果补充分发。
+如果双击 `sentinel.exe` 时弹出“无法启动此程序，因为计算机中丢失 VCRUNTIME140.dll”，说明拿到的是旧版本二进制。仓库已通过 `.cargo/config.toml` 为 Windows MSVC 目标开启 `+crt-static`，重新执行 `cargo build --release`（或下载最新 GitHub Release 产物）即可，运行库会一并打包进 exe。
+
+可以用下面的命令确认新产物不再依赖 `VCRUNTIME140.dll`：
+
+```powershell
+dumpbin /dependents .\target\release\sentinel.exe
+```
+
+如果使用 GNU 交叉编译，按上面的 DLL 检查结果补充分发 `libgcc_s_seh-1.dll` 等文件，生产分发仍优先推荐方式一。
 
 ### SmartScreen / 杀毒软件提示
 
 这是未签名的新二进制，可能出现“Windows 已保护你的电脑”。点击“更多信息 → 仍要运行”。正式分发建议做代码签名。
 
-### 没有弹出 Toast
+### 没有弹出 Toast / 通知时报错
 
 - 确认 `config.toml` 中 `[notify] enabled = true`；
 - 运行 `sentinel.exe notify-test`；
-- Windows 家庭版或通知服务异常时会回退 `msg`；
-- 检查“设置 → 系统 → 通知”是否允许 Windows PowerShell 通知。
+- 当前实现通过 `powershell.exe -EncodedCommand` 发送 WinRT Toast（不落地临时 `.ps1`，也不依赖脚本执行策略），并用 `CREATE_NO_WINDOW` 隐藏控制台窗口；
+- PowerShell 失败时日志里会有一条 `PowerShell Toast 发送失败，尝试 msg 降级`，其中 `stderr` 字段是 PowerShell 的原始报错，按它排查即可；
+- Windows 家庭版或通知服务异常时会回退 `msg` 弹窗；
+- 检查“设置 → 系统 → 通知”是否允许 Windows PowerShell 通知；
+- 如果日志显示 `Windows Toast 与 msg 通知均失败`，优先检查通知服务（`Get-Service WpnService`）以及是否处于“专注助手/勿扰”模式。
 
 ### 想扫描其他盘符
 

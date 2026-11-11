@@ -284,6 +284,7 @@ fn send_windows(title: &str, body: &str, severity: Severity) -> Result<()> {
     let script = format!(
         r#"$ErrorActionPreference = 'Stop'
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+[Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
 $AppId = '{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\WindowsPowerShell\v1.0\powershell.exe'
 $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
@@ -295,32 +296,48 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
         xml_body.replace('\'', "''")
     );
 
-    let path = std::env::temp_dir().join(format!(
-        "datasentinel-notify-{}-{}.ps1",
-        std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-    ));
-    std::fs::write(&path, script).context("写入 Windows 通知脚本失败")?;
-    let result = std::process::Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-        ])
-        .arg(&path)
-        .status();
-    let _ = std::fs::remove_file(&path);
+    // Use -EncodedCommand instead of writing a temporary .ps1 and calling
+    // -File: enterprise Group Policy can forbid script files even with
+    // -ExecutionPolicy Bypass, and Windows PowerShell 5.1 would also decode a
+    // BOM-less script with the ANSI code page (mojibake / invalid toast XML).
+    // An encoded UTF-16LE command avoids both problems and leaves no temp file
+    // for antivirus software to flag.
+    let encoded = encode_powershell_command(&script);
+    let output = {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW: the toast is rendered by the shell, so the helper
+        // PowerShell process must never flash a console window (or print its
+        // errors into the parent console) on screen.
+        std::process::Command::new(powershell_path())
+            .args(["-NoProfile", "-NonInteractive", "-EncodedCommand"])
+            .arg(&encoded)
+            .creation_flags(0x0800_0000)
+            .output()
+    };
 
-    match result {
-        Ok(status) if status.success() => Ok(()),
-        _ => {
+    match output {
+        Ok(output) if output.status.success() => Ok(()),
+        other => {
+            match &other {
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::warn!(
+                        status = %output.status,
+                        stderr = %stderr.trim(),
+                        "PowerShell Toast 发送失败，尝试 msg 降级"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "无法启动 PowerShell，尝试 msg 降级");
+                }
+            }
             // Fallback for Windows editions where WinRT toast is unavailable.
             let _ = severity;
+            use std::os::windows::process::CommandExt;
             let status = std::process::Command::new("msg")
                 .arg("*")
                 .arg(format!("{title}\n{body}"))
+                .creation_flags(0x0800_0000)
                 .status();
             match status {
                 Ok(status) if status.success() => Ok(()),
@@ -330,6 +347,62 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
     }
 }
 
+/// Prefer the absolute path of Windows PowerShell: a trimmed `PATH` (for
+/// example when launched from a service or a restricted shell) would otherwise
+/// make `Command::new("powershell.exe")` fail with "program not found".
+#[cfg(target_os = "windows")]
+fn powershell_path() -> std::path::PathBuf {
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        let candidate = std::path::PathBuf::from(root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    std::path::PathBuf::from("powershell.exe")
+}
+
+/// Encode a PowerShell script the way `powershell.exe -EncodedCommand` expects:
+/// UTF-16LE bytes, base64 encoded without line breaks.
+///
+/// Kept platform-independent so the encoder itself can be unit tested.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn encode_powershell_command(script: &str) -> String {
+    let mut utf16 = Vec::with_capacity(script.len() * 2);
+    for unit in script.encode_utf16() {
+        utf16.extend_from_slice(&unit.to_le_bytes());
+    }
+    base64_encode(&utf16)
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let value = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((value >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((value >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((value >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(value & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
 #[cfg(target_os = "windows")]
 fn xml_escape(value: &str) -> String {
     value
@@ -337,4 +410,33 @@ fn xml_escape(value: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{base64_encode, encode_powershell_command};
+
+    #[test]
+    fn base64_matches_reference_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn powershell_command_is_utf16le_then_base64() {
+        // "A" is 0x41 0x00 in UTF-16LE, which is "QQA=" in base64
+        // ("QQ==" would be the UTF-8 byte 0x41).
+        assert_eq!(encode_powershell_command("A"), "QQA=");
+        // "AB" is 0x41 0x00 0x42 0x00 => "QQBCAA==".
+        assert_eq!(encode_powershell_command("AB"), "QQBCAA==");
+        // Non-ASCII must be encoded as UTF-16 code units, not UTF-8 bytes.
+        // "数" is U+6570 => 0x70 0x65 little endian => "cGU=".
+        assert_eq!(encode_powershell_command("数"), "cGU=");
+        assert!(encode_powershell_command("Write-Host '数据'").is_ascii());
+    }
 }
