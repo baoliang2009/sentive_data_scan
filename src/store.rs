@@ -4,7 +4,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 
 use crate::config::{ensure_private_dir, secure_file};
 use crate::model::{Finding, ScanSummary, Severity, StoredFinding};
@@ -196,7 +196,12 @@ impl Store {
         let key = path_to_key(path);
         let now = now_ts();
         let mut conn = self.conn()?;
-        let tx = conn.transaction()?;
+        // BEGIN IMMEDIATE: the console (`sentinel ui`) and a standalone daemon
+        // may scan the same file at the same time. A deferred transaction would
+        // take a read snapshot first and then fail to upgrade when the other
+        // process commits ("database is locked"), silently losing the scan
+        // result. Taking the write lock up front lets busy_timeout serialize us.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let mut existing: HashMap<String, bool> = HashMap::new();
         {
@@ -260,7 +265,7 @@ impl Store {
     pub fn remove_file(&self, path: &Path) -> Result<()> {
         let key = path_to_key(path);
         let mut conn = self.conn()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("DELETE FROM files WHERE path = ?1", params![key])?;
         tx.execute("DELETE FROM findings WHERE path = ?1", params![key])?;
         tx.commit()?;
@@ -336,7 +341,7 @@ impl Store {
             return Ok(0);
         }
         let mut conn = self.conn()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut updated = 0usize;
         {
             let mut stmt = tx.prepare("UPDATE findings SET acknowledged = 1 WHERE id = ?1")?;
@@ -591,5 +596,53 @@ mod tests {
         store.save_file(path, 10, 100, "hash", &[]).unwrap();
         assert!(!store.needs_scan(path, 10, 100).unwrap());
         assert!(store.needs_scan(path, 11, 100).unwrap());
+    }
+
+    /// `sentinel ui` now embeds the watcher, so two processes can scan the same
+    /// file at the same time. Deferred transactions used to fail with
+    /// "database is locked" when the second writer upgraded its snapshot,
+    /// dropping the result (and the notification) silently.
+    #[test]
+    fn concurrent_writers_on_separate_connections_do_not_lose_data() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = std::env::temp_dir().join(format!(
+            "datasentinel-store-concurrency-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("sentinel.db");
+
+        let workers = 6usize;
+        let barrier = Arc::new(Barrier::new(workers));
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            let db = db.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let store = Store::open(&db).unwrap();
+                barrier.wait();
+                store
+                    .save_file(
+                        Path::new("a.txt"),
+                        10,
+                        100,
+                        "hash",
+                        &[finding("password", "h1")],
+                    )
+                    .map(|outcome| outcome.new_findings)
+            }));
+        }
+
+        let mut new_total = 0;
+        for handle in handles {
+            new_total += handle.join().unwrap().expect("并发写入不应失败");
+        }
+        assert_eq!(new_total, 1, "同一个命中只应计一次新增");
+
+        let store = Store::open(&db).unwrap();
+        assert_eq!(store.stats().unwrap().findings, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
