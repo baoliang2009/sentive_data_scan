@@ -155,6 +155,8 @@ fn run_loop(
                 log_summary(&summary, "增量扫描");
             }
             notifier.notify_scan(&summary);
+            // "编辑并保存"通常不会产生新的敏感值，但仍值得提醒一次。
+            notifier.notify_rescan(&due, &summary);
         }
     }
 

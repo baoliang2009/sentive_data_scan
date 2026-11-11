@@ -92,6 +92,13 @@ macos_mode = "auto"
 # per_file 模式下单批最多通知数量。
 max_per_batch = 5
 
+# 已提醒过的文件被修改并保存后，如果仍然包含敏感数据，是否再次提醒。
+# 只改了其他文字、敏感值没变时也会提醒（同一文件有冷却时间，避免连续保存刷屏）。
+renotify_modified = true
+
+# 同一文件的重复提醒冷却时间（秒）；0 表示不冷却。
+renotify_cooldown_secs = 600
+
 [storage]
 # 为空 = 平台数据目录：
 #   Windows: %LOCALAPPDATA%\DataSentinel\sentinel.db

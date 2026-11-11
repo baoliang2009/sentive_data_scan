@@ -1,6 +1,11 @@
 #[allow(unused_imports)]
 use anyhow::{bail, Context, Result};
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use crate::config::NotifyConfig;
 use crate::model::{ScanSummary, Severity};
 use crate::util::{format_duration, truncate_chars};
@@ -12,6 +17,11 @@ pub struct Notifier {
     sound: bool,
     max_per_batch: usize,
     macos_mode: String,
+    renotify_modified: bool,
+    renotify_cooldown: Duration,
+    /// Last time a given file triggered a "modified but still sensitive"
+    /// alert, so saving the same document repeatedly does not spam the user.
+    recent_alerts: Mutex<HashMap<PathBuf, Instant>>,
 }
 
 impl Notifier {
@@ -23,6 +33,9 @@ impl Notifier {
             sound: config.sound,
             max_per_batch: config.max_per_batch.max(1),
             macos_mode: config.macos_mode.clone(),
+            renotify_modified: config.renotify_modified,
+            renotify_cooldown: Duration::from_secs(config.renotify_cooldown_secs),
+            recent_alerts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -76,6 +89,88 @@ impl Notifier {
         }
 
         notify_summary(self, summary, qualifying, highest);
+    }
+
+    /// Alert when a file is saved again and still contains qualifying sensitive
+    /// data even though no new value appeared (the common "edit and save"
+    /// case). New findings are already covered by [`Notifier::notify_scan`].
+    ///
+    /// `paths` are the files that triggered this scan. Alerts for the same file
+    /// are throttled by `notify.renotify_cooldown_secs`.
+    pub fn notify_rescan(&self, paths: &[PathBuf], summary: &ScanSummary) {
+        if !self.enabled || !self.renotify_modified {
+            return;
+        }
+        // New values are always announced by notify_scan; avoid a second popup.
+        if summary.new_findings > 0 || summary.findings == 0 {
+            return;
+        }
+        // The user already acknowledged every hit in this file: stay quiet.
+        if summary.unacknowledged == 0 {
+            return;
+        }
+        let highest = summary
+            .by_severity
+            .iter()
+            .filter(|(_, count)| **count > 0)
+            .map(|(severity, _)| *severity)
+            .max();
+        let Some(highest) = highest else {
+            return;
+        };
+        if highest < self.min_severity {
+            return;
+        }
+
+        let now = Instant::now();
+        let mut recent = match self.recent_alerts.lock() {
+            Ok(recent) => recent,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut due: Vec<&PathBuf> = paths
+            .iter()
+            .filter(|path| {
+                recent
+                    .get(*path)
+                    .map(|last| now.duration_since(*last) >= self.renotify_cooldown)
+                    .unwrap_or(true)
+            })
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        // Keep the map from growing forever in long-running daemons.
+        if recent.len() > 512 {
+            let keep = self.renotify_cooldown.max(Duration::from_secs(3600));
+            recent.retain(|_, last| now.duration_since(*last) < keep);
+        }
+
+        due.truncate(3);
+        for path in &due {
+            recent.insert((*path).clone(), now);
+        }
+        drop(recent);
+
+        let names: Vec<String> = due
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string_lossy().into_owned())
+            })
+            .collect();
+        let title = "数据哨兵：文件已修改，仍含敏感数据";
+        let body = format!(
+            "{} · 最高级别：{}\n本次共 {} 处命中，请确认是否需要清理。",
+            names.join("、"),
+            highest.label_zh(),
+            summary.findings
+        );
+        if let Err(error) = send_desktop(title, &body, highest, self.sound, &self.macos_mode) {
+            tracing::warn!(error = %error, "桌面通知发送失败");
+        } else {
+            tracing::info!(count = due.len(), "已发送文件修改提醒");
+        }
     }
 
     pub fn test(&self) -> Result<()> {

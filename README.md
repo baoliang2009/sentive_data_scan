@@ -117,7 +117,7 @@ sentinel ui --no-watch      # 只提供控制台，不监听落盘（需要手�
 - **不引入 WebView / Tauri**：界面由同一个二进制内置提供，三平台都用系统自带浏览器打开。麒麟上无需安装 WebKitGTK，产物仍是单文件可执行，CI 三平台构建流程不变。
 - **只监听回环地址**：绑定 `127.0.0.1`，并用随机会话令牌校验 `X-Sentinel-Token`，其他网页无法驱动本机接口。
 - **改配置保留注释**：开关规则、修改设置只就地改写对应键值，不会冲掉 `config.toml` 里的注释；写入前备份为 `config.toml.bak`。
-- **控制台不替代守护进程**：它是查看与操作入口；需要落盘实时监控仍用 `sentinel daemon`，或在设置页安装开机自启。
+- **控制台自带监控**：`sentinel ui` 默认在后台运行落盘监听与定时对账，不必再单独开 `daemon`；顶部「落盘监控运行中」是真实状态。只想查看历史时可加 `--no-watch`，长期无人值守仍建议 `autostart install`。
 
 ## 配置
 
@@ -152,6 +152,8 @@ enabled = true
 min_severity = "medium"
 mode = "summary"                # summary | per_file | off
 macos_mode = "auto"             # auto | alert | notification（macOS）
+renotify_modified = true        # 文件被修改后仍含敏感数据时再次提醒
+renotify_cooldown_secs = 600    # 同一文件重复提醒冷却时间
 
 [storage]
 store_raw_match = false         # 默认只存脱敏值

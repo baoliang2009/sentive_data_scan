@@ -115,6 +115,11 @@ pub struct NotifyConfig {
     /// macOS only: `auto` (dialog for medium+, notification for low),
     /// `alert` (always dialog) or `notification` (notification center only).
     pub macos_mode: String,
+    /// Re-alert when a watched file is saved again and still contains
+    /// qualifying sensitive data, even if no new value appeared.
+    pub renotify_modified: bool,
+    /// Minimum gap between two alerts for the same file, in seconds.
+    pub renotify_cooldown_secs: u64,
 }
 
 impl Default for NotifyConfig {
@@ -126,6 +131,8 @@ impl Default for NotifyConfig {
             sound: true,
             max_per_batch: 5,
             macos_mode: "auto".to_string(),
+            renotify_modified: true,
+            renotify_cooldown_secs: 600,
         }
     }
 }

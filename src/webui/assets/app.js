@@ -1277,6 +1277,18 @@
           ])
         ),
         rowHtml(
+          '已修改文件重复提醒',
+          '文件保存后仍含敏感数据时再次提醒（只改了其他文字也算）；同一文件有冷却时间',
+          switchHtml('notify.renotify_modified', data.notify.renotify_modified)
+        ),
+        rowHtml(
+          '重复提醒冷却',
+          '同一文件在该时间内最多提醒一次；0 表示不冷却',
+          '<input class="input narrow" type="number" min="0" value="' +
+            data.notify.renotify_cooldown_secs +
+            '" data-setting="notify.renotify_cooldown_secs"> <span class="small muted">秒</span>'
+        ),
+        rowHtml(
           '测试通知链路',
           '发送一条测试通知，确认系统通知权限已开启',
           '<button class="btn btn-sm" data-action="test-notify">发送测试通知</button>'

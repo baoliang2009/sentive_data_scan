@@ -830,6 +830,8 @@ fn get_settings(ctx: &AppContext) -> Response {
             "min_severity": config.notify.min_severity.as_str(),
             "mode": config.notify.mode,
             "macos_mode": config.notify.macos_mode,
+            "renotify_modified": config.notify.renotify_modified,
+            "renotify_cooldown_secs": config.notify.renotify_cooldown_secs,
         },
         "storage": {
             "retention_days": config.storage.retention_days,
@@ -950,7 +952,14 @@ fn notify_object(value: &Value) -> Vec<(String, Value)> {
         None => return Vec::new(),
     };
     let mut out = Vec::new();
-    for key in ["enabled", "min_severity", "mode", "macos_mode"] {
+    for key in [
+        "enabled",
+        "min_severity",
+        "mode",
+        "macos_mode",
+        "renotify_modified",
+        "renotify_cooldown_secs",
+    ] {
         if let Some(value) = map.get(key) {
             out.push((key.to_string(), value.clone()));
         }

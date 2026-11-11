@@ -359,6 +359,9 @@ impl Scanner {
                         stats
                             .new_findings
                             .fetch_add(outcome.new_findings, Ordering::Relaxed);
+                        stats
+                            .unacknowledged
+                            .fetch_add(outcome.unacknowledged, Ordering::Relaxed);
                         for (severity, count) in &outcome.new_by_severity {
                             stats.new_severity[*severity as usize]
                                 .fetch_add(*count, Ordering::Relaxed);
@@ -429,6 +432,7 @@ struct ScanStats {
     failed: AtomicU64,
     findings: AtomicU64,
     new_findings: AtomicU64,
+    unacknowledged: AtomicU64,
     severity: [AtomicU64; 5],
     new_severity: [AtomicU64; 5],
     examples: Mutex<Vec<FindingExample>>,
@@ -508,6 +512,7 @@ impl ScanStats {
             files_failed: self.failed.load(Ordering::Relaxed),
             findings: self.findings.load(Ordering::Relaxed),
             new_findings: self.new_findings.load(Ordering::Relaxed),
+            unacknowledged: self.unacknowledged.load(Ordering::Relaxed),
             by_severity,
             new_by_severity,
             examples,

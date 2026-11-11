@@ -69,6 +69,8 @@ pub struct FileState {
 pub struct SaveOutcome {
     pub findings: u64,
     pub new_findings: u64,
+    /// Findings that are still visible in the console (not acknowledged).
+    pub unacknowledged: u64,
     pub new_by_severity: BTreeMap<Severity, u64>,
     pub new_hashes: HashSet<String>,
 }
@@ -255,6 +257,9 @@ impl Store {
                 outcome.new_findings += 1;
                 outcome.new_hashes.insert(finding.match_hash.clone());
                 *outcome.new_by_severity.entry(finding.severity).or_insert(0) += 1;
+            }
+            if !acknowledged {
+                outcome.unacknowledged += 1;
             }
         }
         drop(insert);

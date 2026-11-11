@@ -126,6 +126,9 @@ pub struct ScanSummary {
     pub files_failed: u64,
     pub findings: u64,
     pub new_findings: u64,
+    /// Findings still shown as unacknowledged; acknowledged ones are ignored by
+    /// the "file modified again" reminder.
+    pub unacknowledged: u64,
     pub by_severity: BTreeMap<Severity, u64>,
     pub new_by_severity: BTreeMap<Severity, u64>,
     pub examples: Vec<FindingExample>,
