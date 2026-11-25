@@ -33,7 +33,7 @@
 2. **最小留存**：默认只保存脱敏值（如 `110101********1234`）、规则 ID、文件路径、行号与上下文片段；不保存原始命中内容。
 3. **最小权限**：以当前用户身份运行，不要求管理员/root；只读扫描用户有权限的文件。
 4. **可审计**：每次扫描写运行记录；发现项可确认（ack），数据库与报告文件在 Unix 上以 `0600` 创建。
-5. **防误报优先**：身份证校验位、银行卡 Luhn、上下文关键词、熵值、占位符过滤共同降低噪音。
+5. **防误报优先**：身份证行政区划/校验位、银行卡 BIN + Luhn、座机区号表、上下文关键词、熵值、占位符过滤共同降低噪音。
 
 ---
 
@@ -86,8 +86,9 @@ data-sentinel/
 │   ├── model.rs                 # Severity / Finding / ScanSummary
 │   ├── rules/
 │   │   ├── mod.rs               # RuleSet、编译、扫描、去重
-│   │   ├── builtin.rs           # 内置规则表
-│   │   └── validator.rs         # 校验位、Luhn、熵、占位符
+│   │   ├── builtin.rs           # 内置规则清单
+│   │   ├── tables.rs            # 身份证地区码 / 卡 BIN / 座机区号常量表
+│   │   └── validator.rs         # 校验位、BIN、Luhn、熵、占位符
 │   ├── detect.rs                # 解码、分块、文本/Office 提取、检测引擎
 │   ├── scan.rs                  # 目录遍历 + rayon 并行 + 增量台账
 │   ├── watch.rs                 # notify 监听、去抖、定时对账
@@ -216,7 +217,7 @@ notify::RecommendedWatcher（每平台原生后端）
    - `RegexSet` 一次性匹配所有规则，得到候选规则下标，再对候选规则做捕获提取。
    - 可选 Aho-Corasick 字面量锚点（如 `AKIA`、`BEGIN PRIVATE KEY`、`密码`）作为更廉价的预筛。
 4. **规则级校验（降误报）**
-   - 身份证校验位 + 出生日期合法性；银行卡 Luhn；手机号号段；密码/密钥熵值；占位符与变量引用过滤。
+   - 身份证行政区划 + 校验位 + 出生日期；银行卡 Luhn + BIN 号段 + 长度；手机号号段；座机区号表；密码/密钥熵值；占位符与变量引用过滤。
    - 关键词上下文窗口（如“密码/口令/password”附近才认定密码字段）。
 5. **结果级去重**
    - 同一文件内按 `(起始偏移, 结束偏移)` 去重，重叠规则保留最高严重级别。
@@ -250,8 +251,8 @@ notify::RecommendedWatcher（每平台原生后端）
 
 - 每条规则包含：`id / name / category / severity / regex / keywords / validators / description`。
 - **第一个捕获组即敏感值**；无捕获组时使用整段匹配。这样密码规则可以只把 `secret=` 后面的值作为命中，而不是整行。
-- Rust `regex` 不支持 lookaround，规则统一用 `\b` 与校验器替代零宽断言。
-- 自定义规则直接写正则，支持 `keywords`（上下文必须出现其一）和 `validator`（`none/luhn/cn_id/phone/entropy:3.2/placeholder`）。
+- Rust `regex` 不支持 lookaround。中文属于 Unicode 单词字符，紧贴中文标签的号码必须用 `(?-u:\b)`（仅 ASCII 边界），否则会整条漏检；数字串用 `(?:^|[^0-9])` 做左边界。
+- 自定义规则直接写正则，支持 `keywords`（上下文必须出现其一）和 `validator`（`none/luhn/bank_card/cn_id/cn_id_15/phone/landline/social_security/passport/entropy:3.2/placeholder`）。
 - 规则编译失败在启动时报错并指出规则 ID，避免静默失效。
 
 ---
@@ -260,13 +261,14 @@ notify::RecommendedWatcher（每平台原生后端）
 
 | 规则 ID | 名称 | 严重级别 | 校验 |
 |---|---|---|---|
-| `cn_id_card` | 中国大陆居民身份证号（18 位） | 高 | 校验位 + 出生日期 |
-| `cn_id_card_15` | 一代身份证号（15 位） | 中 | 出生日期 |
-| `cn_mobile` | 中国大陆手机号 | 中 | 号段 + 无效号过滤 |
-| `cn_landline` | 固定电话 | 低 | 格式 |
+| `cn_id_card` | 中国大陆居民身份证号（18 位） | 高 | 行政区划 + 出生日期 + 校验位 |
+| `cn_id_card_15` | 一代身份证号（15 位） | 中 | 行政区划 + 出生日期 |
+| `cn_social_security` | 社会保障卡号 | 高 | 中文标签 + 位数 |
+| `cn_mobile` | 中国大陆手机号 | 中 | 号段 + 未分配号段 + 连号过滤 |
+| `cn_landline` | 固定电话 | 低 | 区号表 + 本地号码位数 |
 | `email` | 电子邮箱 | 中 | 格式 + 占位符过滤 |
-| `bank_card` | 银行卡号（紧凑格式） | 高 | Luhn + BIN 前缀 |
-| `bank_card_formatted` | 银行卡号（4 位分组） | 高 | Luhn |
+| `bank_card` | 银行卡号（紧凑格式） | 高 | Luhn + 银联 BIN 号段 + 卡号长度 |
+| `bank_card_formatted` | 银行卡号（4 位分组） | 高 | Luhn + 银联 BIN 号段 + 卡号长度 |
 | `password_assignment` | 密码赋值/配置项 | 高 | 熵 + 占位符 |
 | `generic_secret` | 通用密钥/令牌赋值 | 高 | 熵 + 关键词 + 占位符 |
 | `private_key` | PEM/OpenSSH 私钥头 | 严重 | 字面量 |
@@ -279,9 +281,23 @@ notify::RecommendedWatcher（每平台原生后端）
 | `openai_key` | OpenAI API Key | 高 | 前缀 |
 | `jwt` | JSON Web Token | 中 | 三段式结构 |
 | `bearer_token` | Authorization Bearer | 高 | 上下文 |
-| `cn_passport` | 中国护照号 | 中 | 格式 |
+| `cn_passport` | 中国护照号 | 中 | 普通/公务/外交护照号规则 |
 
 > 规则表是可数据化的清单，新增规则通常只需要在 `builtin.rs` 添加一行，或在 TOML 中写自定义规则，无需改检测引擎。
+
+### 5.1 中国本地化校验数据
+
+`src/rules/tables.rs` 存放三张纯常量表，供校验器做 `binary_search`，不产生任何运行期 I/O：
+
+| 表 | 粒度 | 作用 |
+|---|---|---|
+| `ID_PREFECTURE_PREFIXES` | 身份证前 4 位（省 + 地级市） | 挡掉 `99xxxx`、`0000xx`、时间戳/流水号开头的 18 位数字 |
+| `BANK_BIN_RANGES` | 5 位卡 BIN 区间 + 允许的卡号长度位图 | 只有真实号段 + 合法长度才继续做 Luhn，杜绝“13-19 位数字 + Luhn”的大面积误报 |
+| `LANDLINE_AREA_CODES` | 不含前导 0 的国内区号 | 座机号必须命中真实区号，再叠加电话相关关键词 |
+
+- 卡 BIN 数据整理自公开银联 BIN 列表（`bububa/bankcn`，Apache-2.0），已把 6 位及更短的 BIN 展开成 5 位前缀区间；未收录的号段回落到 Visa/Mastercard/Amex/JCB/Discover 的 IIN 规则。
+- 身份证地区码只校验到地级市，区县撤并/新增不影响召回；港澳台居民居住证使用 `810000/820000/830000` 前缀。
+- 三张表都是排序数组，新增数据时保持升序即可；单元测试会校验典型正反例。
 
 ---
 

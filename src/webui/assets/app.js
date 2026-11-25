@@ -976,7 +976,7 @@
       '<section class="card"><div class="card-head"><h2>规则测试</h2>' +
       '<span class="spacer"></span><span class="muted">在本机执行，不会上传任何内容</span></div>' +
       '<div class="card-body">' +
-      '<textarea class="textarea" id="rule-test-input" style="min-height:110px" placeholder="粘贴一段文本，立即用当前启用的规则检测。例如：\n联系人 13812345678，身份证 11010519491231002X，password = &quot;Aa123456!&quot;"></textarea>' +
+      '<textarea class="textarea" id="rule-test-input" style="min-height:110px" placeholder="粘贴一段文本，立即用当前启用的规则检测。例如：\n联系人 13812345678，身份证 11010519491231002X，银行卡 6222021234567890128，password = &quot;Aa123456!&quot;"></textarea>' +
       '<div style="display:flex;gap:8px;align-items:center;margin-top:10px">' +
       '<button class="btn btn-primary" data-action="test-rules">开始测试</button>' +
       '<button class="btn btn-ghost" data-action="clear-test">清空</button>' +

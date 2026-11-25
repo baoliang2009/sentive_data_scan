@@ -136,6 +136,10 @@ min_severity = "low"
 #
 # 说明：
 # - pattern 使用 Rust regex 语法（不支持 lookaround）。
+#   匹配“紧贴中文标签”的号码时，请用 `(?-u:\b)` 作为 ASCII 单词边界，
+#   例如 `(?-u:\b)(\d{18})(?-u:\b)`；普通 `\b` 在中文旁会失效。
 # - 第一个捕获组视为敏感值；没有捕获组时使用整段匹配。
-# - validator 支持：none, luhn, cn_id, cn_id_15, phone, placeholder, entropy:3.2
+# - validator 支持：none, luhn, bank_card, cn_id, cn_id_15, phone, landline,
+#   social_security, passport, placeholder, entropy:3.2
 #   多个校验器用逗号分隔，例如 "entropy:3.5,placeholder"。
+#   bank_card = Luhn + 银联/国际卡组织 BIN 号段 + 卡号长度三重校验。

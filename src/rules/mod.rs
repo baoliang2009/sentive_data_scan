@@ -1,4 +1,5 @@
 pub mod builtin;
+pub(crate) mod tables;
 pub mod validator;
 
 use std::collections::HashSet;
@@ -369,6 +370,91 @@ mod tests {
         assert!(!findings
             .iter()
             .any(|finding| finding.rule_id == "bank_card"));
+    }
+
+    #[test]
+    fn detects_values_glued_to_chinese_labels() {
+        // 中文属于 Unicode 单词字符，普通 \b 会在“身份证”“手机”后面失效。
+        let text = "身份证320102198001010016手机19912345678卡号6222021234567890128座机0311-8561234社保卡号：220102198";
+        let findings = rules().scan(text, Path::new("cn.txt"), 1 << 20, 160, false);
+        let ids: Vec<&str> = findings.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(ids.contains(&"cn_id_card"), "got {ids:?}");
+        assert!(ids.contains(&"cn_mobile"), "got {ids:?}");
+        assert!(ids.contains(&"bank_card"), "got {ids:?}");
+        assert!(ids.contains(&"cn_landline"), "got {ids:?}");
+        assert!(ids.contains(&"cn_social_security"), "got {ids:?}");
+    }
+
+    #[test]
+    fn rejects_numeric_noise() {
+        // 时间戳、雪花 ID、订单号、条码、长数字串都不应被当成证件号或卡号。
+        let text = "\
+             订单 202311241530451234\n\
+             雪花 1699999999999999999\n\
+             时间 202311241530\n\
+             条码 6901234567892\n\
+             编码 01234567890\n\
+             合同 2023-11-24-001\n\
+             金额 1234567890123456\n\
+             无效身份证 990105194912310023\n\
+             无效卡号 6222000000000009\n";
+        let findings = rules().scan(text, Path::new("noise.txt"), 1 << 20, 160, false);
+        assert!(findings.is_empty(), "unexpected findings: {findings:#?}");
+    }
+
+    #[test]
+    fn landline_needs_phone_context() {
+        let with_label = rules().scan(
+            "联系电话 010-85612345",
+            Path::new("tel.txt"),
+            1 << 20,
+            160,
+            false,
+        );
+        assert!(with_label.iter().any(|f| f.rule_id == "cn_landline"));
+
+        // 没有电话相关上下文时，形如区号+号码的流水号不报。
+        let bare = rules().scan(
+            "内部编码 02023112412",
+            Path::new("tel.txt"),
+            1 << 20,
+            160,
+            false,
+        );
+        assert!(bare.is_empty(), "unexpected findings: {bare:#?}");
+    }
+
+    #[test]
+    fn social_security_requires_label() {
+        let with_label = rules().scan(
+            "社保卡号：220102198\n医保编号: 330102198",
+            Path::new("ss.txt"),
+            1 << 20,
+            160,
+            false,
+        );
+        assert_eq!(
+            with_label
+                .iter()
+                .filter(|f| f.rule_id == "cn_social_security")
+                .count(),
+            2
+        );
+        let bare = rules().scan("220102198", Path::new("ss.txt"), 1 << 20, 160, false);
+        assert!(bare.is_empty(), "bare number must not match: {bare:#?}");
+
+        // 标签后面跟着更长数字串时不能截断成 8-14 位命中。
+        let long = rules().scan(
+            "社保卡号：2201021980011223344",
+            Path::new("ss.txt"),
+            1 << 20,
+            160,
+            false,
+        );
+        assert!(
+            long.is_empty(),
+            "long digit run must not truncate: {long:#?}"
+        );
     }
 
     #[test]

@@ -186,7 +186,8 @@ pub struct CustomRuleConfig {
     /// Rust `regex` syntax. The first capture group is treated as the secret.
     pub pattern: String,
     pub keywords: Vec<String>,
-    /// Comma separated: none, luhn, cn_id, cn_id_15, phone, placeholder, entropy:3.2
+    /// Comma separated: none, luhn, bank_card, cn_id, cn_id_15, phone, landline,
+    /// social_security, passport, placeholder, entropy:3.2
     pub validator: String,
     pub description: String,
     pub context_chars: usize,

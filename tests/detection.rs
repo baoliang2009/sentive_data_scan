@@ -20,7 +20,7 @@ fn end_to_end_scan_dedupe_and_report() -> anyhow::Result<()> {
          身份证: 11010519491231002X\n\
          手机号: 13812345678\n\
          邮箱: alice@corp.cn\n\
-         银行卡: 4111 1111 1111 1111\n\
+         银行卡: 4242 4242 4242 4242\n\
          密码: a8F#k2Lm9Qz!\n\
          无效身份证: 110105194912310021\n\
          -----BEGIN RSA PRIVATE KEY-----\n\

@@ -10,8 +10,8 @@
 - **增量扫描**：`notify` 监听创建/修改/重命名，去抖后只扫描变化文件，不必反复全量遍历。
 - **规则变更补偿**：修改规则、阈值或自定义规则后，下次扫描会自动重扫未变化文件，避免新规则漏检旧文件。
 - **对账补偿**：启动、定时对账按 `size + mtime` 跳过未变化文件，关机期间漏掉的事件也能补齐。
-- **内置规则**：身份证（18/15 位）、手机号、座机、邮箱、银行卡（Luhn）、密码、通用密钥、PEM 私钥、AWS/GitHub/Google/Slack/Stripe/OpenAI Token、JWT、Bearer、护照等。
-- **高精度**：身份证校验位/出生日期、银行卡 Luhn、熵值、占位符过滤、关键词上下文、跨块去重。
+- **内置规则**：身份证（18/15 位）、社保卡号、手机号、座机、邮箱、银行卡（Luhn + BIN）、密码、通用密钥、PEM 私钥、AWS/GitHub/Google/Slack/Stripe/OpenAI Token、JWT、Bearer、护照等。
+- **高精度**：身份证校验位/出生日期/行政区划、银行卡 Luhn + 银联 BIN 号段 + 卡号长度、座机区号表、熵值、占位符过滤、关键词上下文、跨块去重。
 - **Office 抽取**：直接扫描 `.docx/.xlsx/.pptx` 内部文本。
 - **脱敏存储**：只保存 `110105********002X` 这类脱敏值、行号、上下文和哈希；支持 HTML/JSON 报告。
 - **本地控制台**：`sentinel ui` 启动图形界面（概览 / 命中记录 / 检测规则 / 设置），带实时扫描进度、筛选搜索、批量确认与报告导出；仅监听 `127.0.0.1`，三平台统一用系统浏览器打开。控制台进程默认自带落盘监控，文件落到扫描目录会立即检测并提醒（`--no-watch` 可关闭）。
@@ -174,9 +174,11 @@ validator = "none"
 
 自定义规则说明：
 
-- `pattern` 使用 Rust `regex` 语法，不支持 lookaround。
+- `pattern` 使用 Rust `regex` 语法，不支持 lookaround。匹配紧贴中文标签的号码时请用
+  `(?-u:\b)`（ASCII 单词边界），普通 `\b` 在中文旁会失效。
 - 第一个捕获组视为敏感值；没有捕获组时使用整段匹配。
-- `validator` 支持 `none`、`luhn`、`cn_id`、`cn_id_15`、`phone`、`placeholder`、`entropy:3.2`，可逗号组合。
+- `validator` 支持 `none`、`luhn`、`bank_card`、`cn_id`、`cn_id_15`、`phone`、
+  `landline`、`social_security`、`passport`、`placeholder`、`entropy:3.2`，可逗号组合。
 - `keywords` 要求命中附近出现任一关键词，用于降低误报。
 
 ## 平台说明
@@ -252,7 +254,7 @@ powershell -ExecutionPolicy Bypass -File .\build-windows.ps1
 cargo test
 ```
 
-覆盖：身份证校验位、Luhn、手机号、占位符、编码识别、分块边界、规则引擎、SQLite 去重/确认状态。
+覆盖：身份证校验位/行政区划、银行卡 BIN + Luhn、手机号号段、座机区号、社保卡号标签联动、占位符、编码识别、分块边界、规则引擎、SQLite 去重/确认状态，以及时间戳/订单号/雪花 ID 等常见数字噪声的误报回归。
 
 ## 目录结构
 
@@ -262,7 +264,7 @@ src/
   cli.rs         clap 定义
   config.rs      配置与常用目录探测
   model.rs       Finding / 统计模型
-  rules/         规则集、内置规则、校验器
+  rules/         规则集、内置规则、本地区划/卡 BIN 常量表、校验器
   detect.rs      编码、二进制嗅探、Office 抽取
   scan.rs        遍历、并行、增量台账
   watch.rs       notify 监听与去抖

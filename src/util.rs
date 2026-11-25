@@ -31,6 +31,25 @@ pub fn path_to_key(path: &Path) -> String {
 
 /// Mask a sensitive value so it can be safely stored, logged and displayed.
 pub fn mask_value(rule_id: &str, value: &str) -> String {
+    // 卡号/证件号常写成 "6222 0212 3456 7890" 或 "010-85612345"，
+    // 掩码前先去掉分隔符，避免露出 "**** 128" 这种带空格的尾巴。
+    let normalized;
+    let value = if rule_id.contains("bank_card")
+        || rule_id.contains("id_card")
+        || rule_id.contains("mobile")
+        || rule_id.contains("landline")
+        || rule_id.contains("phone")
+        || rule_id.contains("social_security")
+        || rule_id.contains("passport")
+    {
+        normalized = value
+            .chars()
+            .filter(|ch| !matches!(ch, ' ' | '-' | '\u{3000}'))
+            .collect::<String>();
+        normalized.as_str()
+    } else {
+        value
+    };
     let chars: Vec<char> = value.chars().collect();
     let len = chars.len();
     let keep = |head: usize, tail: usize| -> String {
@@ -69,6 +88,12 @@ pub fn mask_value(rule_id: &str, value: &str) -> String {
     }
     if rule_id.contains("id_card") {
         return keep(6, 4);
+    }
+    if rule_id.contains("social_security") {
+        return keep(2, 2);
+    }
+    if rule_id.contains("passport") {
+        return keep(2, 2);
     }
     if rule_id.contains("mobile") || rule_id.contains("landline") || rule_id.contains("phone") {
         return keep(3, 4);
