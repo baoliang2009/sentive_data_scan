@@ -82,7 +82,6 @@ pub struct Scanner {
     progress: Option<Arc<ScanProgress>>,
     forwarder: Option<Arc<crate::syslog::Forwarder>>,
 }
-
 impl Scanner {
     pub fn new(config: Arc<Config>, store: Arc<Store>, rules: RuleSet) -> Result<Self> {
         let filter = PathFilter::build(&config)?;
@@ -105,17 +104,29 @@ impl Scanner {
             tracing::info!("检测规则已变化，下次扫描将对未变化文件执行全量重扫");
         }
         let detector = Detector::new(rules, &config);
-        let forwarder = match crate::syslog::Forwarder::spawn(&config.syslog) {
-            Some(forwarder) => {
-                tracing::info!(
-                    min_severity = config.syslog.min_severity.as_str(),
-                    discovery = %config.syslog.discovery,
-                    "syslog 外发已启用"
-                );
-                Some(forwarder)
+        // 身份需要落库（agent_id 跨重启稳定），失败时退化为临时身份，
+        // 不能因为读不到数据库就让外发整体不可用。
+        let identity = match crate::identity::Identity::load_or_create(&store, &config) {
+            Ok(identity) => identity,
+            Err(error) => {
+                tracing::warn!(error = %error, "读取终端身份失败，改用临时身份");
+                crate::identity::Identity::ephemeral(&config)
             }
-            None => None,
         };
+        let forwarder =
+            match crate::syslog::Forwarder::spawn_with_identity(&config.syslog, identity.clone()) {
+                Some(forwarder) => {
+                    tracing::info!(
+                        min_severity = config.syslog.min_severity.as_str(),
+                        discovery = %config.syslog.discovery,
+                        agent_id = %identity.agent_id,
+                        username = %identity.username,
+                        "syslog 外发已启用"
+                    );
+                    Some(forwarder)
+                }
+                None => None,
+            };
         Ok(Self {
             config,
             store,
@@ -138,6 +149,17 @@ impl Scanner {
             if sent > 0 || failed > 0 || dropped > 0 {
                 tracing::info!(sent, failed, dropped, "syslog 外发统计");
             }
+        }
+    }
+
+    /// 上报一次「终端在线」心跳。
+    ///
+    /// 服务端只在收到含命中的报文时才登记终端，所以「在线」必须由调用方
+    /// 主动上报：常驻进程（`sentinel ui` / `daemon`）启动时发一次、之后
+    /// 周期性重发，控制台「终端」页才不会把安静但活着的机器当成离线。
+    pub fn heartbeat(&self) {
+        if let Some(forwarder) = &self.forwarder {
+            forwarder.submit_heartbeat();
         }
     }
 

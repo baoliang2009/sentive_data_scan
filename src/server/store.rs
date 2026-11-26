@@ -281,9 +281,11 @@ impl ServerStore {
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8)
              ON CONFLICT(id) DO UPDATE SET
                 hostname = excluded.hostname,
-                username = excluded.username,
-                platform = excluded.platform,
-                version = excluded.version,
+                -- 空值不覆盖已有信息：老版本客户端不带这些字段，
+                -- 不能让它们把心跳登记好的用户名/平台/版本清空。
+                username = CASE WHEN excluded.username = '' THEN agents.username ELSE excluded.username END,
+                platform = CASE WHEN excluded.platform = '' THEN agents.platform ELSE excluded.platform END,
+                version = CASE WHEN excluded.version = '' THEN agents.version ELSE excluded.version END,
                 last_seen = excluded.last_seen,
                 rule_revision = MAX(agents.rule_revision, excluded.rule_revision),
                 remote_addr = excluded.remote_addr",
@@ -347,6 +349,58 @@ impl ServerStore {
     }
 
     // ------------------------------------------------------------- agents --
+
+    /// 登记或刷新一台终端（心跳路径）。
+    ///
+    /// 与 `ingest` 的区别：这里**不写任何告警**，只维护 `agents` 行。
+    /// 这样一台没有新命中的机器也能出现在控制台「终端」页；否则服务端
+    /// 只能看到「曾经告警过的机器」，运维会误判为离线。
+    pub fn touch_agent(
+        &self,
+        agent_id: &str,
+        hostname: &str,
+        username: &str,
+        platform: &str,
+        version: &str,
+        remote_addr: &str,
+    ) -> Result<()> {
+        let now = crate::util::now_ts();
+        // 与 ingest 保持同一套兜底规则，避免同一台机器出现两条记录。
+        let agent_id = if agent_id.trim().is_empty() {
+            format!("legacy-{}", crate::util::sha256_hex_str(hostname.trim()))
+        } else {
+            agent_id.trim().to_string()
+        };
+        let hostname = if hostname.trim().is_empty() {
+            "unknown".to_string()
+        } else {
+            hostname.trim().to_string()
+        };
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO agents(id, hostname, username, platform, version, first_seen, last_seen, rule_revision, remote_addr)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?6, 0, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+                hostname = excluded.hostname,
+                username = CASE WHEN excluded.username = '' THEN agents.username ELSE excluded.username END,
+                platform = CASE WHEN excluded.platform = '' THEN agents.platform ELSE excluded.platform END,
+                version = CASE WHEN excluded.version = '' THEN agents.version ELSE excluded.version END,
+                last_seen = excluded.last_seen,
+                remote_addr = excluded.remote_addr",
+            params![
+                agent_id,
+                hostname,
+                username.trim(),
+                platform.trim(),
+                version.trim(),
+                now,
+                remote_addr,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
 
     pub fn agents(&self) -> Result<Vec<Agent>> {
         let conn = self.conn()?;

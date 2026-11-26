@@ -11,6 +11,7 @@ pub mod autostart;
 pub mod cli;
 pub mod config;
 pub mod detect;
+pub mod identity;
 pub mod mdns;
 pub mod model;
 pub mod notify;

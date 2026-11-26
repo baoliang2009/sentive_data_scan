@@ -22,6 +22,12 @@ use crate::util::format_duration;
 /// 丢事件后还有定时全量对账兜底。
 const EVENT_QUEUE_CAPACITY: usize = 8192;
 
+/// 「终端在线」心跳间隔。
+///
+/// 服务端只用 `agents.last_seen` 表示在线状态，5 分钟一次既能让控制台在
+/// 一个刷新周期内看到机器上线/离线，又不会给 syslog 链路带来明显流量。
+const HEARTBEAT_INTERVAL_SECS: u64 = 300;
+
 pub fn run(config: Arc<Config>, scanner: Arc<Scanner>, notifier: Notifier) -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     let running_flag = running.clone();
@@ -111,6 +117,10 @@ fn run_loop(
         scanner.flush_syslog();
     }
 
+    // 启动即报到：否则一台没有新命中的机器要等到下次落盘命中才会
+    // 出现在服务端「终端」页。
+    scanner.heartbeat();
+
     let debounce = Duration::from_millis(config.watch.debounce_ms.max(200));
     let max_pending = config.watch.max_pending.max(100);
     let interval = if config.scan.full_scan_interval_hours == 0 {
@@ -125,6 +135,9 @@ fn run_loop(
     let mut last_full_scan = Instant::now();
     let mut last_drop_log = Instant::now();
     let mut last_log_prune = Instant::now();
+    // 心跳：构造 Scanner 时已发过一次，这里负责长期保活。
+    let mut last_heartbeat = Instant::now();
+    let heartbeat_interval = Duration::from_secs(HEARTBEAT_INTERVAL_SECS);
 
     while running.load(Ordering::SeqCst) {
         if let Some((receiver, dropped)) = receiver.as_ref() {
@@ -169,6 +182,12 @@ fn run_loop(
         if last_log_prune.elapsed() >= Duration::from_secs(86_400) {
             crate::config::prune_old_logs(&config.logs_dir(), crate::config::LOG_RETENTION_DAYS);
             last_log_prune = Instant::now();
+        }
+
+        // 「终端在线」心跳：没有新命中的机器也要让服务端看见。
+        if last_heartbeat.elapsed() >= heartbeat_interval {
+            scanner.heartbeat();
+            last_heartbeat = Instant::now();
         }
 
         if let Some(interval) = interval {

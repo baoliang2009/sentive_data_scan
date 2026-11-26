@@ -22,6 +22,7 @@ use chrono::{SecondsFormat, Utc};
 use serde_json::json;
 
 use crate::config::{SyslogConfig, SyslogServerConfig};
+use crate::identity::Identity;
 use crate::model::{Finding, Severity};
 
 /// 单条报文上限。RFC 5424 要求至少支持 2048 字节；这里放宽到 8 KiB，
@@ -34,6 +35,11 @@ const SD_ID: &str = "datasentinel@32473";
 pub struct SyslogSender {
     config: SyslogConfig,
     hostname: String,
+    /// 终端身份（agent_id / 用户名 / 平台 / 版本）。
+    ///
+    /// 服务端要靠这些字段把报文归属到某台终端、某个使用者；缺了它们服务端
+    /// 只能退化成 `legacy-<hostname 哈希>`，控制台「终端」页也就没法读。
+    identity: Identity,
     transport: Mutex<Transport>,
     /// 当前生效的目标（地址 + 协议）。mDNS 模式下会随发现结果更新。
     target: Mutex<Option<Target>>,
@@ -64,20 +70,36 @@ impl SyslogSender {
     ///
     /// `mdns` 模式下允许 `server` 为空：首次发送时通过 mDNS 解析。
     pub fn from_config(config: &SyslogConfig) -> Option<Self> {
+        Self::from_config_with_identity(config, Identity::ephemeral_default())
+    }
+
+    /// 同上，但使用调用方提供的终端身份（常驻进程应传入落库的稳定 `agent_id`）。
+    pub fn from_config_with_identity(config: &SyslogConfig, identity: Identity) -> Option<Self> {
         if !config.enabled {
             return None;
         }
         if !config.uses_mdns() && config.endpoint().is_none() {
             return None;
         }
+        // 主机名只有一个来源：显式配置优先，其次身份里的值，最后探本机。
+        // 心跳与命中报文共用它，避免同一台机器在服务端出现两种主机名。
         let hostname = if config.hostname.trim().is_empty() {
-            local_hostname()
+            if identity.hostname.trim().is_empty() {
+                local_hostname()
+            } else {
+                identity.hostname.trim().to_string()
+            }
         } else {
             config.hostname.trim().to_string()
+        };
+        let identity = Identity {
+            hostname: hostname.clone(),
+            ..identity
         };
         Some(Self {
             config: config.clone(),
             hostname,
+            identity,
             transport: Mutex::new(Transport::Uninitialized),
             target: Mutex::new(None),
             resolve_lock: Mutex::new(()),
@@ -321,6 +343,10 @@ impl SyslogSender {
         };
         let mut payload = json!({
             "event": "finding",
+            "agent_id": self.identity.agent_id,
+            "username": self.identity.username,
+            "platform": self.identity.platform,
+            "version": self.identity.version,
             "rule_id": finding.rule_id,
             "rule_name": finding.rule_name,
             "category": finding.category,
@@ -338,6 +364,47 @@ impl SyslogSender {
             payload["snippet"] = json!(finding.snippet);
         }
         self.wrap(finding.severity, &finding.rule_id, &payload.to_string())
+    }
+
+    /// 组装一条「终端在线」心跳报文。
+    ///
+    /// 为什么需要它：服务端只在收到**含命中**的报文时才登记终端，于是一台
+    /// 没有新敏感数据的机器永远不出现在控制台里。心跳让「终端」页反映真实
+    /// 在线情况，而不是只显示「曾经告警过的机器」。
+    ///
+    /// 心跳**只带身份**（agent_id / 用户名 / 平台 / 版本），不包含任何文件
+    /// 路径或命中内容，因此不会扩大数据外发面。
+    pub fn heartbeat_message(&self) -> String {
+        let payload = json!({
+            "event": "heartbeat",
+            "agent_id": self.identity.agent_id,
+            "username": self.identity.username,
+            "platform": self.identity.platform,
+            "version": self.identity.version,
+            "hostname": self.hostname,
+            "time": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        });
+        self.wrap(Severity::Info, "heartbeat", &payload.to_string())
+    }
+
+    /// 发送一条心跳。返回是否送达。
+    pub fn send_heartbeat(&self) -> bool {
+        let Some(target) = self.resolve_target() else {
+            return false;
+        };
+        let timeout = Duration::from_millis(self.config.timeout_ms.max(200));
+        let message = self.heartbeat_message();
+        let mut transport = match self.transport.lock() {
+            Ok(transport) => transport,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match self.send_one(&mut transport, &target, message.as_bytes(), timeout) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::debug!(error = %error, "syslog 心跳发送失败");
+                false
+            }
+        }
     }
 
     /// 组装 RFC 5424 报文。
@@ -483,6 +550,8 @@ enum Job {
         path: PathBuf,
         findings: Vec<Finding>,
     },
+    /// 「终端在线」心跳，让服务端在没有命中时也能登记本机。
+    Heartbeat,
     /// 测试/退出时的同步屏障：外发线程处理到它时回传信号。
     Barrier(std::sync::mpsc::SyncSender<()>),
 }
@@ -492,7 +561,12 @@ impl Forwarder {
     ///
     /// `mdns` 模式下允许 `server` 为空——地址在首次发送时才解析。
     pub fn spawn(config: &SyslogConfig) -> Option<Arc<Self>> {
-        let sender = SyslogSender::from_config(config)?;
+        Self::spawn_with_identity(config, Identity::ephemeral_default())
+    }
+
+    /// 同上，但使用调用方提供的终端身份。
+    pub fn spawn_with_identity(config: &SyslogConfig, identity: Identity) -> Option<Arc<Self>> {
+        let sender = SyslogSender::from_config_with_identity(config, identity)?;
         let min_severity = config.min_severity;
         let mdns = config.uses_mdns();
         let server = config.endpoint().unwrap_or_default();
@@ -522,6 +596,11 @@ impl Forwarder {
                     match job {
                         Job::Barrier(ack) => {
                             let _ = ack.try_send(());
+                        }
+                        // 心跳失败不计数为「丢弃」：它只是在线状态，
+                        // 下一轮会重试，不该污染告警外发的统计。
+                        Job::Heartbeat => {
+                            sender.send_heartbeat();
                         }
                         Job::Batch { path, findings } => {
                             let qualifying: Vec<Finding> = findings
@@ -558,6 +637,13 @@ impl Forwarder {
         if let Err(std::sync::mpsc::TrySendError::Full(_)) = self.tx.try_send(job) {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             tracing::debug!("syslog 外发队列已满，丢弃一批命中");
+        }
+    }
+
+    /// 投递一条心跳；队列满时直接丢弃（下一轮会重发）。
+    pub fn submit_heartbeat(&self) {
+        if let Err(std::sync::mpsc::TrySendError::Full(_)) = self.tx.try_send(Job::Heartbeat) {
+            tracing::debug!("syslog 外发队列已满，跳过本轮心跳");
         }
     }
 

@@ -278,3 +278,132 @@ fn rejects_overlong_mdns_service_name() {
     config.syslog.mdns_service = "_datasentinel._udp.local.".to_string();
     assert!(config.validate().is_ok());
 }
+
+/// 回归：命中报文必须带上终端身份（agent_id / 用户名 / 平台 / 版本）。
+///
+/// 缺这些字段时服务端只能退化成 `legacy-<主机名哈希>`，「终端」页的
+/// 用户名/平台全是空——这正是「服务端看不到客户端」的表象之一。
+#[test]
+fn finding_payload_carries_agent_identity() -> anyhow::Result<()> {
+    let socket = UdpSocket::bind("127.0.0.1:0")?;
+    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let address = socket.local_addr()?.to_string();
+
+    let sender = data_sentinel::syslog::SyslogSender::from_config_with_identity(
+        &SyslogConfig {
+            enabled: true,
+            protocol: "udp".to_string(),
+            server: address,
+            ..SyslogConfig::default()
+        },
+        data_sentinel::identity::Identity {
+            agent_id: "agent-under-test".to_string(),
+            hostname: "pc01".to_string(),
+            username: "alice".to_string(),
+            platform: "macos-aarch64".to_string(),
+            version: "9.9.9".to_string(),
+        },
+    )
+    .expect("sender");
+
+    let finding = data_sentinel::model::Finding {
+        rule_id: "cn_mobile".to_string(),
+        rule_name: "手机".to_string(),
+        category: "contact".to_string(),
+        severity: Severity::High,
+        path: Path::new("/tmp/a.txt").to_path_buf(),
+        line: 1,
+        column: 1,
+        masked: "138********5678".to_string(),
+        snippet: String::new(),
+        match_hash: "h1".to_string(),
+        raw: None,
+        start: 0,
+        end: 0,
+    };
+    let (sent, failed) = sender.send_findings(Path::new("/tmp/a.txt"), &[finding]);
+    assert_eq!((sent, failed), (1, 0));
+
+    let mut buffer = [0u8; 8192];
+    let (len, _) = socket.recv_from(&mut buffer)?;
+    let text = String::from_utf8_lossy(&buffer[..len]);
+    for expected in [
+        "\"agent_id\":\"agent-under-test\"",
+        "\"username\":\"alice\"",
+        "\"platform\":\"macos-aarch64\"",
+        "\"version\":\"9.9.9\"",
+    ] {
+        assert!(text.contains(expected), "缺少 {expected}：{text}");
+    }
+    Ok(())
+}
+
+/// 回归：机器没有新命中时也必须能被服务端看见。
+///
+/// 服务端原来只在收到「含 findings 的报文」时才写 `agents`，于是一台
+/// 没有新敏感数据的客户端永远不出现在控制台「终端」页。心跳报文让
+/// 「在线」与「有告警」解耦。
+#[test]
+fn heartbeat_registers_agent_without_any_finding() -> anyhow::Result<()> {
+    use data_sentinel::server::ingest::{parse_message, Payload};
+    use data_sentinel::server::store::ServerStore;
+
+    let socket = UdpSocket::bind("127.0.0.1:0")?;
+    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let address = socket.local_addr()?.to_string();
+
+    let sender = data_sentinel::syslog::SyslogSender::from_config_with_identity(
+        &SyslogConfig {
+            enabled: true,
+            protocol: "udp".to_string(),
+            server: address,
+            ..SyslogConfig::default()
+        },
+        data_sentinel::identity::Identity {
+            agent_id: "heartbeat-agent".to_string(),
+            hostname: "pc-online".to_string(),
+            username: "bob".to_string(),
+            platform: "linux-x86_64".to_string(),
+            version: "0.3.0".to_string(),
+        },
+    )
+    .expect("sender");
+
+    assert!(sender.send_heartbeat(), "心跳应发送成功");
+
+    let mut buffer = [0u8; 8192];
+    let (len, peer) = socket.recv_from(&mut buffer)?;
+    let text = String::from_utf8_lossy(&buffer[..len]);
+    assert!(text.contains("event=\"heartbeat\""), "{text}");
+    // 心跳绝不能带任何文件路径或命中内容。
+    assert!(!text.contains("path"), "心跳不应包含路径：{text}");
+
+    // 用真实解析 + 入库，确认服务端会登记这台终端。
+    let Payload::Heartbeat(heartbeat) = parse_message(&text)? else {
+        panic!("应解析成心跳：{text}");
+    };
+    let dir = tempfile::tempdir()?;
+    let store = ServerStore::open(&dir.path().join("srv.db"))?;
+    store.touch_agent(
+        &heartbeat.agent_id,
+        &heartbeat.hostname,
+        &heartbeat.username,
+        &heartbeat.platform,
+        &heartbeat.version,
+        &peer.ip().to_string(),
+    )?;
+
+    let agents = store.agents()?;
+    assert_eq!(agents.len(), 1, "心跳应登记一台终端");
+    let agent = &agents[0];
+    assert_eq!(agent.id, "heartbeat-agent");
+    assert_eq!(agent.hostname, "pc-online");
+    assert_eq!(agent.username, "bob");
+    assert_eq!(agent.platform, "linux-x86_64");
+    // 心跳不产生告警。
+    assert!(store
+        .events(&data_sentinel::server::store::EventFilter::default())?
+        .0
+        .is_empty());
+    Ok(())
+}

@@ -25,6 +25,8 @@ pub struct IngestStats {
     pub accepted: AtomicU64,
     pub rejected: AtomicU64,
     pub events: AtomicU64,
+    /// 收到并处理成功的终端心跳数。
+    pub heartbeats: AtomicU64,
 }
 
 impl IngestStats {
@@ -34,6 +36,7 @@ impl IngestStats {
             "accepted": self.accepted.load(Ordering::Relaxed),
             "rejected": self.rejected.load(Ordering::Relaxed),
             "events": self.events.load(Ordering::Relaxed),
+            "heartbeats": self.heartbeats.load(Ordering::Relaxed),
         })
     }
 }
@@ -116,7 +119,7 @@ impl SinglePayload {
     }
 }
 
-/// 从一行原始报文里提取 JSON。
+/// 从一行报文里提取 JSON。
 ///
 /// RFC 5424 形如：`<35>1 2026-11-26T... host app proc - [sd] {json}`，
 /// JSON 一定在最后一段（structured-data 内部不含花括号）。
@@ -130,22 +133,59 @@ pub fn extract_json(message: &str) -> Option<&str> {
     Some(&message[start..=end])
 }
 
-/// 解析一行报文为可入库的批次；返回 `None` 表示「忽略」（如测试报文）。
+/// 一条「终端在线」心跳。
+///
+/// 与命中报文分开建模：心跳没有任何 `findings`，只用来刷新
+/// `agents.last_seen`，让控制台能看到「没有告警但在线」的机器。
+#[derive(Debug, Clone, Deserialize)]
+pub struct Heartbeat {
+    #[serde(default)]
+    pub agent_id: String,
+    #[serde(default)]
+    pub hostname: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub platform: String,
+    #[serde(default)]
+    pub version: String,
+}
+
+/// 解析结果：只有这三种形态，避免调用方再判断「空批量」。
+#[derive(Debug, Clone)]
+pub enum Payload {
+    /// 含命中的上报批次。
+    Findings(Box<IncomingBatch>),
+    /// 终端心跳（不含任何命中）。
+    Heartbeat(Heartbeat),
+    /// 明确忽略（例如连通性测试报文）。
+    Ignored,
+}
+
+/// 解析一行报文为可入库的载荷。
 ///
 /// 不用 `#[serde(untagged)]`：`IncomingBatch` 的字段全部可选，
 /// serde 会先把单条报文成功匹配成「空批量」，导致数据静默丢失。
-/// 这里显式按 `findings` 字段判别两种形态。
-pub fn parse_message(message: &str) -> Result<Option<IncomingBatch>> {
+/// 这里显式按 `findings` / `event` 字段判别形态。
+pub fn parse_message(message: &str) -> Result<Payload> {
     let Some(json) = extract_json(message) else {
         anyhow::bail!("报文里没有 JSON 载荷");
     };
     let value: serde_json::Value = serde_json::from_str(json).context("JSON 载荷无法解析")?;
     if value.get("findings").is_some() {
         let batch: IncomingBatch = serde_json::from_value(value).context("批量上报结构不合法")?;
-        return Ok(Some(batch));
+        return Ok(Payload::Findings(Box::new(batch)));
+    }
+    // 心跳必须在单条告警之前判断：它同样没有 findings，但带 event=heartbeat。
+    if value.get("event").and_then(serde_json::Value::as_str) == Some("heartbeat") {
+        let heartbeat: Heartbeat = serde_json::from_value(value).context("心跳结构不合法")?;
+        return Ok(Payload::Heartbeat(heartbeat));
     }
     let single: SinglePayload = serde_json::from_value(value).context("告警结构不合法")?;
-    Ok(single.into_batch())
+    Ok(match single.into_batch() {
+        Some(batch) => Payload::Findings(Box::new(batch)),
+        None => Payload::Ignored,
+    })
 }
 
 /// 启动接收器（非阻塞：在后台线程里跑，返回统计句柄）。
@@ -292,7 +332,8 @@ fn handle_line(
     stats: &Arc<IngestStats>,
 ) {
     match parse_message(message) {
-        Ok(Some(batch)) => {
+        Ok(Payload::Findings(batch)) => {
+            let batch = *batch;
             if batch.findings.is_empty() {
                 return;
             }
@@ -307,7 +348,27 @@ fn handle_line(
                 }
             }
         }
-        Ok(None) => {
+        Ok(Payload::Heartbeat(heartbeat)) => {
+            // 心跳只刷新在线状态，不产生告警；失败也单独计数，
+            // 免得把「终端登记失败」和「报文格式错误」混为一谈。
+            match store.touch_agent(
+                &heartbeat.agent_id,
+                &heartbeat.hostname,
+                &heartbeat.username,
+                &heartbeat.platform,
+                &heartbeat.version,
+                &peer.ip().to_string(),
+            ) {
+                Ok(()) => {
+                    stats.heartbeats.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error) => {
+                    stats.rejected.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(error = %format!("{error:#}"), "写入终端心跳失败");
+                }
+            }
+        }
+        Ok(Payload::Ignored) => {
             // 测试报文：链路正常，不计数为失败。
             tracing::debug!(%peer, "收到连通性测试报文");
         }
@@ -378,7 +439,9 @@ mod tests {
     #[test]
     fn parses_single_finding() {
         let line = r#"<35>1 2026-11-26T10:00:00Z host DataSentinel 1 - [x] {"event":"finding","rule_id":"cn_id_card","rule_name":"身份证","category":"identity","severity":"high","value":"110105********002X","path":"/home/u/a.txt","line":3,"match_hash":"h1","hostname":"pc01","username":"alice"}"#;
-        let batch = parse_message(line).unwrap().unwrap();
+        let Payload::Findings(batch) = parse_message(line).unwrap() else {
+            panic!("应解析成命中批次");
+        };
         assert_eq!(batch.hostname, "pc01");
         assert_eq!(batch.username, "alice");
         assert_eq!(batch.findings.len(), 1);
@@ -392,15 +455,30 @@ mod tests {
     fn parses_batch_payload() {
         let line =
             r#"{"agent_id":"a1","hostname":"pc01","findings":[{"rule_id":"x","severity":"low"}]}"#;
-        let batch = parse_message(line).unwrap().unwrap();
+        let Payload::Findings(batch) = parse_message(line).unwrap() else {
+            panic!("应解析成命中批次");
+        };
         assert_eq!(batch.agent_id, "a1");
         assert_eq!(batch.findings.len(), 1);
+    }
+
+    /// 心跳报文必须与命中报文区分开：它没有 findings，但带 event=heartbeat。
+    #[test]
+    fn parses_heartbeat() {
+        let line = r#"<30>1 2026-11-26T10:00:00Z host DataSentinel 1 - [x] {"event":"heartbeat","agent_id":"abc","hostname":"pc01","username":"alice","platform":"macos-aarch64","version":"0.3.0"}"#;
+        let Payload::Heartbeat(heartbeat) = parse_message(line).unwrap() else {
+            panic!("应解析成心跳");
+        };
+        assert_eq!(heartbeat.agent_id, "abc");
+        assert_eq!(heartbeat.username, "alice");
+        assert_eq!(heartbeat.platform, "macos-aarch64");
+        assert_eq!(heartbeat.version, "0.3.0");
     }
 
     #[test]
     fn ignores_test_event() {
         let line = r#"<36>1 2026-11-26T10:00:00Z host DataSentinel 1 - [x] {"event":"test","message":"ping"}"#;
-        assert!(parse_message(line).unwrap().is_none());
+        assert!(matches!(parse_message(line).unwrap(), Payload::Ignored));
     }
 
     #[test]
