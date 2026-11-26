@@ -7,7 +7,7 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use data_sentinel::cli::{
     AckArgs, AutostartCommand, Cli, Command, ConfigCommand, FindingsArgs, RulesCommand, ScanArgs,
-    TestArgs,
+    SyslogCommand, TestArgs,
 };
 use data_sentinel::config::{self, expand_path, write_default_config, Config};
 use data_sentinel::detect::{Detector, ExtractOutcome};
@@ -84,8 +84,11 @@ fn run(cli: Cli) -> Result<()> {
             if !args.no_notify {
                 Notifier::new(&config.notify).notify_scan(&summary);
             }
+            // 短命进程：等外发队列排空再退出，避免刚启动就丢报文。
+            scanner.flush_syslog();
             Ok(())
         }
+        Command::Syslog(args) => handle_syslog(&config, args.command),
         Command::Watch(args) | Command::Daemon(args) => {
             if args.no_startup_scan {
                 config.scan.scan_on_startup = false;
@@ -128,6 +131,96 @@ fn run(cli: Cli) -> Result<()> {
                     Ok(())
                 }
                 RulesCommand::Test(test) => run_rule_test(&config, rules, test),
+            }
+        }
+    }
+}
+
+fn handle_syslog(config: &Config, command: SyslogCommand) -> Result<()> {
+    match command {
+        SyslogCommand::Test { server } => {
+            let mut syslog = config.syslog.clone();
+            if let Some(server) = server {
+                syslog.enabled = true;
+                syslog.server = server;
+            }
+            if !syslog.enabled {
+                bail!("syslog 未启用，请先在配置文件中设置 [syslog] enabled = true");
+            }
+            let Some(sender) = data_sentinel::syslog::SyslogSender::from_config(&syslog) else {
+                bail!("syslog.server 为空，无法发送");
+            };
+            sender.send_test()?;
+            println!("测试报文已发送到 {}（{}）", syslog.server, syslog.protocol);
+            Ok(())
+        }
+        SyslogCommand::Serve {
+            bind,
+            output,
+            advertise,
+            no_advertise,
+        } => {
+            let mut server = config.syslog_server.clone();
+            server.enabled = true;
+            if let Some(bind) = bind {
+                server.bind = bind;
+            }
+            if let Some(output) = output {
+                server.output = output;
+            }
+            if advertise {
+                server.advertise = true;
+            }
+            if no_advertise {
+                server.advertise = false;
+            }
+            if !server.transport_supported() {
+                bail!("syslog 服务端仅支持 udp / tcp，当前：{}", server.protocol);
+            }
+            if server.instance.trim().is_empty() {
+                server.instance = data_sentinel::mdns::default_instance_name();
+            }
+            let advertise = server.advertise;
+            data_sentinel::syslog::SyslogServer::new(server).run_with_advertise(advertise)
+        }
+        SyslogCommand::Discover {
+            service,
+            timeout_ms,
+        } => {
+            let service = service.unwrap_or_else(|| config.syslog.mdns_service.clone());
+            let timeout = std::time::Duration::from_millis(
+                timeout_ms
+                    .unwrap_or(config.syslog.mdns_timeout_ms)
+                    .clamp(500, 60_000),
+            );
+            println!(
+                "正在通过 mDNS 查找 {service}（最多 {} ms）…",
+                timeout.as_millis()
+            );
+            match data_sentinel::mdns::discover(&service, timeout)? {
+                Some(found) => {
+                    println!("发现 syslog 服务端：");
+                    println!("  实例：{}", found.instance);
+                    println!("  地址：{}", found.endpoint);
+                    if let Some(protocol) = &found.protocol {
+                        println!("  协议：{protocol}（由服务端 TXT 声明）");
+                    }
+                    let addresses: Vec<String> = found
+                        .addresses
+                        .iter()
+                        .map(|addr| addr.to_string())
+                        .collect();
+                    println!("  全部地址：{}", addresses.join(", "));
+                    println!();
+                    println!("在客户端配置中设置：");
+                    println!("  [syslog]");
+                    println!("  enabled = true");
+                    println!("  discovery = \"mdns\"");
+                    Ok(())
+                }
+                None => {
+                    bail!("未发现 {service}；请确认服务端已启动并开启 syslog_server.advertise")
+                }
             }
         }
     }

@@ -43,7 +43,7 @@
 ┌──────────────────────────────────────────────────────────────────┐
 │                          sentinel CLI                            │
 │  ui / scan / watch(daemon) / findings / report / ack / rules /   │
-│  config / autostart / notify-test                                │
+│  syslog(test/serve/discover) / config / autostart / notify-test  │
 └───────────────┬──────────────────────────────────────────────────┘
                 │
 ┌───────────────▼──────────────────────────────────────────────────┐
@@ -93,6 +93,8 @@ data-sentinel/
 │   ├── scan.rs                  # 目录遍历 + rayon 并行 + 增量台账
 │   ├── watch.rs                 # notify 监听、去抖、定时对账
 │   ├── store.rs                 # SQLite 持久化
+│   ├── syslog.rs                # RFC 5424 外发（异步队列）+ 接收端
+│   ├── mdns.rs                  # mDNS/DNS-SD 自动发现与广播
 │   ├── notify.rs                # 三平台桌面通知
 │   ├── autostart.rs             # 三平台开机自启
 │   ├── report.rs                # HTML / JSON 报告
@@ -340,6 +342,27 @@ database = ""                 # 空 = 平台数据目录
 reports_dir = ""
 store_raw_match = false       # 默认只存脱敏值
 
+[syslog]                      # 命中外发到日志服务端（默认关闭）
+enabled = false
+protocol = "udp"              # udp | tcp | unix
+server = ""                   # host:port；discovery = "mdns" 时可留空
+discovery = "static"          # static | mdns（局域网自动发现）
+mdns_service = "_datasentinel._udp.local."
+mdns_timeout_ms = 4000
+facility = "auth"             # auth / daemon / local0-local7
+min_severity = "medium"
+include_snippet = true
+send_raw = false              # 默认只发脱敏值
+timeout_ms = 2000
+
+[syslog_server]               # sentinel syslog serve 的默认监听参数
+protocol = "udp"
+bind = "0.0.0.0:5514"
+output = ""
+advertise = true              # 是否通过 mDNS 广播供客户端发现
+mdns_service = "_datasentinel._udp.local."
+instance = ""                 # 空 = DataSentinel-<hostname>
+
 [rules]
 disabled = []
 min_severity = "low"
@@ -391,7 +414,76 @@ meta(key PK, value)
 
 ---
 
-## 9. 开机自启
+## 9. Syslog 外发
+
+命中数据可通过 RFC 5424 syslog 推送到日志服务端，用于集中审计或接入 SIEM。
+
+```
+Scanner (rayon)                    Forwarder 线程              Network
+──────────────                     ────────────────            ───────
+save_file() → new_hashes                                                  │
+      │ try_send (bounded 4096)                                          │
+      └──────────────► SyncSender ──► SyslogSender::send_findings ──► UDP/TCP/Unix
+                                             │ 失败只记 WARN + 计数
+                                             ▼
+                                      sent / failed / dropped
+```
+
+| 关注点 | 设计 |
+|---|---|
+| 阻塞风险 | 扫描线程只做 `try_send`，套接字读写全在单独的 `sentinel-syslog` 线程；队列满则丢弃并计数，绝不反压扫描 |
+| 隐私 | `send_raw` 默认 false，外发 `value` 为脱敏值；`snippet` 也是脱敏后的上下文；控制台开启原文需二次确认 |
+| 去重 | 只用 `SaveOutcome.new_hashes` 命中，未变化文件/旧记录不会重复推送 |
+| 可靠性 | TCP 采用换行分帧（RFC 6587 non-transparent），断线自动重连一次；UDP 尽力而为 |
+| 报文 | `<PRI>1 TIMESTAMP HOST APP PROCID - [datasentinel@32473 event="…" severity="…"] {JSON}`，MSG 为单行 JSON，超大报文按 UTF-8 边界截断到 8 KiB |
+| 级别映射 | Critical→crit(2)、High→err(3)、Medium→warning(4)、Low→notice(5)、Info→info(6) |
+| 生命周期 | `sentinel scan` 退出前 `flush_syslog()` 等队列排空（3 s 上限）；watch/daemon 每批次后刷新 |
+
+接收侧：`sentinel syslog serve` 提供一个最小 UDP/TCP 接收端（打印 + 落盘到数据目录 `syslog/received.log`，权限 `0600`），用于自测与在没有采集器的环境里兜底；生产环境建议直接对接 rsyslog / syslog-ng。
+
+### 9.1 mDNS 自动发现
+
+客户端不必手填服务端 IP：服务端把自己的 `host + port + protocol` 通过 mDNS/DNS-SD 广播，客户端 browse 到实例后自动拼出 `ip:port`。
+
+```
+服务端 syslog serve                       客户端
+──────────────────                       ──────
+bind 0.0.0.0:5514
+advertise = true
+   │ ServiceInfo(
+   │   ty=_datasentinel._udp.local.,
+   │   host=<hostname>.local.,
+   │   port=5514,
+   │   addr_auto → 本机全部非回环 IP,
+   │   TXT protocol=udp/ver/app)
+   ▼
+mDNS 组播 224.0.0.251:5353  ──────►  browse → ServiceResolved
+                                        │ SRV.port + A/AAAA.addr
+                                        ▼
+                                      Target { server, protocol }
+                                        │ 缓存 30 s
+                                        ▼
+                                     UDP/TCP 发送
+```
+
+| 关注点 | 实现 |
+|---|---|
+| 地址选择 | 排序权重：私网 IPv4(0) → 其他 IPv4(1) → IPv6(2)；过滤 `0.0.0.0`、回环、`169.254/16`、IPv6 链路本地（需 scope id 无法直接连） |
+| 协议来源 | TXT 里 `protocol=udp\|tcp` 优先于本地配置，避免“发现到了却用错协议” |
+| 失败收敛 | 发现失败 → 回落静态 `server`；两者都无 → 本批跳过 + 日志，不影响扫描 |
+| 失效重试 | 一批全部发送失败时清空缓存与传输层，下批重新发现（应对服务端换机/换 IP） |
+| 端口争用 | 每次发现新建短生命周期 `ServiceDaemon`，结束即 `shutdown()`；不常驻 5353，避免与 Avahi/Bonjour/Termius 等争用 |
+| 时效 | 缓存 30 s；服务端换 IP 后最迟 30 s 或一次全失败后重新解析 |
+| 安全 | 广播内容只有服务名、IP、端口、协议与版本号，**不含任何命中数据**；保密环境可 `advertise = false` |
+| 局限 | mDNS 仅限同一广播域，不跨路由；企业禁用组播时自动回落静态配置 |
+| 平台差异 | Windows 用 `SO_REUSEADDR`（多进程可同时收包）→ 同机自测稳定；Linux/macOS 用 `SO_REUSEPORT`（负载均衡语义）→ 与 Avahi/mDNSResponder 共存时分包，跨机正常 |
+| 依赖 | 内置纯 Rust 实现，Windows 无需安装 Bonjour，Linux 无需 Avahi 守护进程 |
+
+诊断：`sentinel syslog discover [--service ...] [--timeout-ms ...]`，控制台设置页也提供「查找服务端」按钮（`POST /api/syslog/discover`）。
+
+---
+
+## 10. 开机自启
 
 | 平台 | 机制 | 说明 |
 |---|---|---|
@@ -405,19 +497,21 @@ meta(key PK, value)
 
 ---
 
-## 10. 安全、合规与运维
+## 11. 安全、合规与运维
 
-- **不联网**：无遥测、无云端；未来若加上报必须显式配置并二次确认。
+- **默认不联网**：无遥测、无云端。唯一的网络出口是显式开启的 `[syslog]`，且默认只发脱敏值；`send_raw` 需二次确认。
 - **最小数据**：默认不存原文；报告与数据库 Unix 权限 `0600`，目录 `0700`。
 - **排除自身**：数据库、日志、报告目录自动加入排除，避免扫描结果再次触发通知。
 - **性能保护**：文件大小上限、解压上限、线程上限、临时文件过滤、失败重试上限。
 - **可观测性**：日志按天滚动；`scan_runs` 记录每次扫描统计；`sentinel findings` 查看最近命中。
 - **升级兼容**：配置 serde 默认值；数据库 `meta.schema_version` 预留迁移。
 - **已知限制**：用户态 watcher 在网络盘/部分 FUSE 文件系统上可能丢事件，依赖定时对账兜底；恶意软件可绕过；不替代专业 DLP。
+- **syslog 链路**：UDP/TCP 明文传输，跨不可信网络需自行加 TLS 代理或隧道；外发失败只记日志，不保证投递（如需可靠投递请用 TCP + 服务端 ACK 方案）。
+- **mDNS 暴露面**：广播内容仅含服务名、IP、端口、协议与版本，不含命中数据；但会把本机标注为"数据哨兵节点"，高保密环境应关闭 `advertise` 改用静态地址。mDNS 只在本广播域内有效，不跨路由。
 
 ---
 
-## 11. 路线图
+## 12. 路线图
 
 1. **v1（本仓库）**：三平台 CLI + 全量/增量扫描 + 内置规则 + 脱敏存储 + 通知 + 自启。
 2. **v1.1**：PDF 文本抽取、更多 Office 旧格式、规则热加载、配置变更自动 reload。
@@ -427,7 +521,7 @@ meta(key PK, value)
 
 ---
 
-## 12. 验收标准
+## 13. 验收标准
 
 - 三平台 `cargo build --release` 通过，产物为单文件可执行程序。
 - 首次运行自动生成配置；`sentinel scan` 能扫描默认目录并输出统计。

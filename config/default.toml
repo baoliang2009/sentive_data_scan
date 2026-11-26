@@ -115,6 +115,78 @@ store_raw_match = false
 # 发现记录保留天数；0 = 永久保留。
 retention_days = 180
 
+# ---------------------------------------------------------------------------
+# Syslog 外发：把命中的敏感数据以 RFC 5424 报文推送到日志服务端
+# ---------------------------------------------------------------------------
+[syslog]
+# 默认关闭。开启后只发送脱敏值（如 110105********002X），不会外泄原文。
+enabled = false
+
+# 传输协议：udp（默认，最省事）/ tcp（可靠、支持重连）/ unix（本机套接字，仅 Unix）
+protocol = "udp"
+
+# 服务端地址。UDP/TCP 必须是 host:port，例如：
+#   "10.0.0.5:514"        # 标准 syslog 端口（Linux 需 root 或 CAP_NET_BIND_SERVICE）
+#   "log.corp.local:5514" # 非特权端口，推荐给普通用户
+#   "192.168.1.20:6514"   # rsyslog/syslog-ng TLS 端口需自行加证书代理
+# unix 协议则填套接字路径，例如 "/var/run/rsyslog/dev/log"。
+server = ""
+
+# RFC 5424 facility：auth / user / daemon / local0-local7
+facility = "auth"
+
+# 只外发该级别及以上的命中：low / medium / high / critical
+min_severity = "medium"
+
+# 报文 HOSTNAME 字段；留空使用本机主机名。
+hostname = ""
+
+# 报文 APP-NAME 字段。
+app_name = "DataSentinel"
+
+# 是否附带脱敏后的上下文片段（便于服务端定位，但会带上同一行的其他文字）。
+include_snippet = true
+
+# 是否外发命中原文。默认 false；开启前请确认服务端与链路可信。
+send_raw = false
+
+# 单次发送超时（毫秒）；超时只记日志，不会阻塞扫描。
+timeout_ms = 2000
+
+# 服务端地址解析方式：
+#   static = 只用上面的 server 字段
+#   mdns   = 通过 mDNS/DNS-SD 在局域网自动发现服务端，无需填写 IP
+#            发现失败时自动回落到 server（填了的话）
+discovery = "static"
+
+# mDNS 自动发现的服务类型，需与服务端 syslog_server.mdns_service 一致。
+mdns_service = "_datasentinel._udp.local."
+
+# 自动发现超时（毫秒）；超时后回落到静态 server。
+mdns_timeout_ms = 4000
+
+# 接收端（sentinel syslog serve 自测时使用，或配合 rsyslog 做本地落盘）
+[syslog_server]
+enabled = false
+
+# 监听协议：udp / tcp
+protocol = "udp"
+
+# 监听地址；0.0.0.0:5514 表示接收本机与内网全部来源
+bind = "0.0.0.0:5514"
+
+# 接收日志路径；留空写入平台数据目录下的 syslog/received.log
+output = ""
+
+# 是否通过 mDNS 广播自己，让客户端 discovery = "mdns" 自动找到本机。
+advertise = true
+
+# 广播的服务类型，需与客户端 syslog.mdns_service 一致。
+mdns_service = "_datasentinel._udp.local."
+
+# 广播的实例名；留空自动使用 DataSentinel-<主机名>。
+instance = ""
+
 [rules]
 # 关闭不需要的内置规则，例如 ["cn_landline", "email"]
 disabled = []

@@ -92,6 +92,7 @@ fn run_loop(
         let summary = scanner.scan_roots(&scan_roots, false);
         log_summary(&summary, "启动扫描");
         notifier.notify_scan(&summary);
+        scanner.flush_syslog();
     }
 
     let debounce = Duration::from_millis(config.watch.debounce_ms.max(200));
@@ -155,6 +156,7 @@ fn run_loop(
                 log_summary(&summary, "增量扫描");
             }
             notifier.notify_scan(&summary);
+            scanner.flush_syslog();
             // "编辑并保存"通常不会产生新的敏感值，但仍值得提醒一次。
             notifier.notify_rescan(&due, &summary);
         }

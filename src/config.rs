@@ -9,6 +9,12 @@ use crate::model::Severity;
 
 pub const DEFAULT_CONFIG: &str = include_str!("../config/default.toml");
 
+/// DHCP/DNS-SD 约定：服务类型名（`_xxx`）最长 15 字节，实例名才可长。
+pub const DEFAULT_MDNS_SERVICE: &str = "_datasentinel._udp.local.";
+
+/// 测试专用服务类型：避免与真实部署的 `_datasentinel` 广播互相干扰。
+pub const MDNS_TEST_SERVICE: &str = "_dstest._udp.local.";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -18,6 +24,8 @@ pub struct Config {
     pub notify: NotifyConfig,
     pub storage: StorageConfig,
     pub rules: RulesConfig,
+    pub syslog: SyslogConfig,
+    pub syslog_server: SyslogServerConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +174,45 @@ pub struct RulesConfig {
     pub custom: Vec<CustomRuleConfig>,
 }
 
+/// 服务端接收配置（用于 `sentinel syslog-server`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyslogServerConfig {
+    pub enabled: bool,
+    /// `udp` / `tcp`。
+    pub protocol: String,
+    /// 监听地址，例如 `0.0.0.0:514`。
+    pub bind: String,
+    /// 接收日志落盘路径；空则写入数据目录下 `syslog/received.log`。
+    pub output: PathBuf,
+    /// 是否通过 mDNS 广播自己，供客户端自动发现。
+    pub advertise: bool,
+    /// 广播的服务类型；需与客户端 `syslog.mdns_service` 一致。
+    pub mdns_service: String,
+    /// 广播的实例名；空则用 `DataSentinel-<hostname>`。
+    pub instance: String,
+}
+
+impl Default for SyslogServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            protocol: "udp".to_string(),
+            bind: "0.0.0.0:5514".to_string(),
+            output: PathBuf::new(),
+            advertise: true,
+            mdns_service: DEFAULT_MDNS_SERVICE.to_string(),
+            instance: String::new(),
+        }
+    }
+}
+
+impl SyslogServerConfig {
+    pub fn transport_supported(&self) -> bool {
+        matches!(self.protocol.to_ascii_lowercase().as_str(), "udp" | "tcp")
+    }
+}
+
 impl Default for RulesConfig {
     fn default() -> Self {
         Self {
@@ -176,6 +223,86 @@ impl Default for RulesConfig {
     }
 }
 
+/// Syslog 外发：把命中的敏感数据以 RFC 5424 报文推送到服务端。
+///
+/// 默认关闭。开启后只发送脱敏值（`store_raw_match = false` 时的默认行为），
+/// 除非显式打开 `send_raw`；这样“外发”不会变成一次数据泄漏。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyslogConfig {
+    pub enabled: bool,
+    /// `udp` / `tcp` / `unix`。
+    pub protocol: String,
+    /// 服务端地址：UDP/TCP 为 `host:port`，unix 为套接字路径。
+    pub server: String,
+    /// RFC 5424 facility，常见 `auth`(4) / `user`(1) / `local0`-`local7`。
+    pub facility: String,
+    /// 发送的最低命中级别。
+    pub min_severity: Severity,
+    /// 报文 HOSTNAME 字段；空则使用本机主机名。
+    pub hostname: String,
+    /// 报文 APP-NAME 字段。
+    pub app_name: String,
+    /// 是否附带脱敏上下文片段。
+    pub include_snippet: bool,
+    /// 是否外发命中原文（默认关闭，仅脱敏值）。
+    pub send_raw: bool,
+    /// 单次发送超时（毫秒），UDP 也用于避免阻塞扫描线程。
+    pub timeout_ms: u64,
+    /// 服务端地址的解析方式：`static`（只用 `server`）或 `mdns`（局域网自动发现）。
+    pub discovery: String,
+    /// 自动发现的服务类型（DNS-SD），默认 `_datasentinel._udp.local.`。
+    pub mdns_service: String,
+    /// 自动发现超时（毫秒）。超时后回落到静态 `server`。
+    pub mdns_timeout_ms: u64,
+}
+
+impl Default for SyslogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            protocol: "udp".to_string(),
+            server: String::new(),
+            facility: "auth".to_string(),
+            min_severity: Severity::Medium,
+            hostname: String::new(),
+            app_name: "DataSentinel".to_string(),
+            include_snippet: true,
+            send_raw: false,
+            timeout_ms: 2000,
+            discovery: "static".to_string(),
+            mdns_service: DEFAULT_MDNS_SERVICE.to_string(),
+            mdns_timeout_ms: 4000,
+        }
+    }
+}
+
+impl SyslogConfig {
+    /// 解析后的服务端地址；未配置时返回 `None`。
+    pub fn endpoint(&self) -> Option<String> {
+        let server = self.server.trim();
+        if server.is_empty() {
+            None
+        } else {
+            Some(server.to_string())
+        }
+    }
+
+    /// 是否启用 mDNS 自动发现。
+    pub fn uses_mdns(&self) -> bool {
+        self.discovery.eq_ignore_ascii_case("mdns")
+    }
+
+    /// 传输层是否能识别。`unix` 仅 Unix 平台可用。
+    pub fn transport_supported(&self) -> bool {
+        let protocol = self.protocol.to_ascii_lowercase();
+        if protocol == "unix" {
+            cfg!(unix)
+        } else {
+            matches!(protocol.as_str(), "udp" | "tcp")
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CustomRuleConfig {
@@ -284,6 +411,54 @@ impl Config {
         ) {
             bail!("notify.macos_mode 只支持 auto / alert / notification");
         }
+        if !matches!(self.syslog.protocol.as_str(), "udp" | "tcp" | "unix") {
+            bail!("syslog.protocol 只支持 udp / tcp / unix");
+        }
+        if !matches!(self.syslog.discovery.as_str(), "static" | "mdns") {
+            bail!("syslog.discovery 只支持 static / mdns");
+        }
+        if self.syslog.uses_mdns() && !is_valid_mdns_service(&self.syslog.mdns_service) {
+            bail!(
+                "syslog.mdns_service 需形如 _datasentinel._udp.local.（服务名 ≤15 字节），当前：{}",
+                self.syslog.mdns_service
+            );
+        }
+        if self.syslog.enabled {
+            if self.syslog.protocol == "unix" && !cfg!(unix) {
+                bail!("syslog.protocol = \"unix\" 仅在 Unix 平台可用");
+            }
+            if !self.syslog.uses_mdns() && self.syslog.server.trim().is_empty() {
+                bail!("已启用 syslog 外发，但 syslog.server 为空（也可设 discovery = \"mdns\" 自动发现）");
+            }
+            if !self.syslog.uses_mdns()
+                && self.syslog.protocol != "unix"
+                && !has_host_port(&self.syslog.server)
+            {
+                bail!(
+                    "syslog.server 需为 host:port 形式，例如 10.0.0.5:514（当前：{}）",
+                    self.syslog.server
+                );
+            }
+        }
+        if self.syslog_server.enabled {
+            if !self.syslog_server.transport_supported() {
+                bail!("syslog_server.protocol 只支持 udp / tcp");
+            }
+            if !has_host_port(&self.syslog_server.bind) {
+                bail!(
+                    "syslog_server.bind 需为 host:port 形式，例如 0.0.0.0:5514（当前：{}）",
+                    self.syslog_server.bind
+                );
+            }
+            if self.syslog_server.advertise
+                && !is_valid_mdns_service(&self.syslog_server.mdns_service)
+            {
+                bail!(
+                    "syslog_server.mdns_service 需形如 _datasentinel._udp.local.，当前：{}",
+                    self.syslog_server.mdns_service
+                );
+            }
+        }
         let mut ids = HashSet::new();
         for rule in &self.rules.custom {
             if rule.id.trim().is_empty() {
@@ -366,6 +541,42 @@ impl Config {
         normalize(&mut self.storage.database, base);
         normalize(&mut self.storage.reports_dir, base);
     }
+}
+
+/// 校验 mDNS 服务类型：`_name._udp.local.` / `_name._tcp.local.`。
+///
+/// RFC 6763 规定服务名（`_name` 去掉下划线）不超过 15 字节，超过会被
+/// Avahi / Bonjour 拒绝发布，因此这里提前拦截而不是运行期静默失败。
+pub fn is_valid_mdns_service(value: &str) -> bool {
+    let value = value.trim().trim_end_matches('.');
+    let Some((service, rest)) = value.split_once('.') else {
+        return false;
+    };
+    let Some(name) = service.strip_prefix('_') else {
+        return false;
+    };
+    if name.is_empty() || name.len() > 15 {
+        return false;
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    {
+        return false;
+    }
+    matches!(rest, "_udp.local" | "_tcp.local")
+}
+
+/// 校验 `host:port`（支持 IPv6 的 `[::1]:514`），端口必须非 0。
+fn has_host_port(value: &str) -> bool {
+    let value = value.trim();
+    let Some((host, port)) = value.rsplit_once(':') else {
+        return false;
+    };
+    if host.trim().is_empty() {
+        return false;
+    }
+    port.parse::<u16>().map(|port| port > 0).unwrap_or(false)
 }
 
 pub fn resolve_config_path(explicit: Option<&Path>) -> PathBuf {

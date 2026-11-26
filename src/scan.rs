@@ -80,6 +80,7 @@ pub struct Scanner {
     rules_dirty: AtomicBool,
     large_file_lock: Mutex<()>,
     progress: Option<Arc<ScanProgress>>,
+    forwarder: Option<Arc<crate::syslog::Forwarder>>,
 }
 
 impl Scanner {
@@ -104,6 +105,17 @@ impl Scanner {
             tracing::info!("检测规则已变化，下次扫描将对未变化文件执行全量重扫");
         }
         let detector = Detector::new(rules, &config);
+        let forwarder = match crate::syslog::Forwarder::spawn(&config.syslog) {
+            Some(forwarder) => {
+                tracing::info!(
+                    min_severity = config.syslog.min_severity.as_str(),
+                    discovery = %config.syslog.discovery,
+                    "syslog 外发已启用"
+                );
+                Some(forwarder)
+            }
+            None => None,
+        };
         Ok(Self {
             config,
             store,
@@ -114,7 +126,19 @@ impl Scanner {
             rules_dirty: AtomicBool::new(rules_dirty),
             large_file_lock: Mutex::new(()),
             progress: None,
+            forwarder,
         })
+    }
+
+    /// wait until queued syslog messages are flushed (best effort).
+    pub fn flush_syslog(&self) {
+        if let Some(forwarder) = &self.forwarder {
+            forwarder.flush(std::time::Duration::from_secs(3));
+            let (sent, failed, dropped) = forwarder.stats();
+            if sent > 0 || failed > 0 || dropped > 0 {
+                tracing::info!(sent, failed, dropped, "syslog 外发统计");
+            }
+        }
     }
 
     /// Attach live progress counters (used by the local web console).
@@ -370,6 +394,19 @@ impl Scanner {
                             stats.severity[severity as usize].fetch_add(count, Ordering::Relaxed);
                         }
                         stats.add_examples(&findings, &outcome.new_hashes);
+                        // 只外发新增命中：全量对账时旧记录不会重复推送。
+                        if let Some(forwarder) = &self.forwarder {
+                            if !outcome.new_hashes.is_empty() {
+                                let fresh: Vec<Finding> = findings
+                                    .iter()
+                                    .filter(|finding| {
+                                        outcome.new_hashes.contains(&finding.match_hash)
+                                    })
+                                    .cloned()
+                                    .collect();
+                                forwarder.submit(path, fresh);
+                            }
+                        }
                         let done = stats.scanned.load(Ordering::Relaxed);
                         if done % 2000 == 0 {
                             tracing::info!(files_scanned = done, "扫描进行中…");

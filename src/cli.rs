@@ -40,6 +40,8 @@ pub enum Command {
     Ack(AckArgs),
     /// 查看或测试检测规则
     Rules(RulesArgs),
+    /// syslog 外发：测试连通性、启动接收端
+    Syslog(SyslogArgs),
     /// 配置文件操作
     Config(ConfigArgs),
     /// 安装/卸载/查看开机自启
@@ -160,6 +162,46 @@ pub struct TestArgs {
     /// 测试一个文件（支持文本与 docx/xlsx/pptx）
     #[arg(value_name = "FILE")]
     pub path: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct SyslogArgs {
+    #[command(subcommand)]
+    pub command: SyslogCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SyslogCommand {
+    /// 向配置中的服务端发送一条测试报文
+    Test {
+        /// 临时覆盖服务端地址（host:port）
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// 在本机启动 syslog 接收端（便于自测或替代轻量采集器）
+    Serve {
+        /// 监听地址，默认使用配置中的 syslog_server.bind
+        #[arg(long)]
+        bind: Option<String>,
+        /// 接收日志落盘路径
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// 通过 mDNS 广播自己，供客户端自动发现（默认按配置）
+        #[arg(long)]
+        advertise: bool,
+        /// 不通过 mDNS 广播
+        #[arg(long, conflicts_with = "advertise")]
+        no_advertise: bool,
+    },
+    /// 通过 mDNS 自动发现局域网内的 syslog 服务端
+    Discover {
+        /// 临时覆盖服务类型，例如 _datasentinel._udp.local.
+        #[arg(long)]
+        service: Option<String>,
+        /// 发现超时（毫秒）
+        #[arg(long)]
+        timeout_ms: Option<u64>,
+    },
 }
 
 #[derive(Debug, Args)]

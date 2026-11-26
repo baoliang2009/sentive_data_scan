@@ -93,6 +93,9 @@ cargo build --release
 | `sentinel config path\|show\|init [--force]` | 配置操作 |
 | `sentinel autostart install\|uninstall\|status` | 开机自启管理 |
 | `sentinel notify-test` | 桌面通知链路测试 |
+| `sentinel syslog test [--server host:port]` | 向 syslog 服务端发送一条测试报文 |
+| `sentinel syslog serve [--bind 0.0.0.0:5514] [--output FILE]` | 在本机启动 syslog 接收端（自测或轻量采集） |
+| `sentinel syslog discover [--service _ds._udp.local.]` | 通过 mDNS 自动发现局域网内的服务端 |
 
 ## 图形控制台
 
@@ -110,7 +113,7 @@ sentinel ui --no-watch      # 只提供控制台，不监听落盘（需要手�
 | 概览 | 未确认 / 严重高危计数、级别与分类分布、最近命中、扫描历史、上次扫描结果 |
 | 命中记录 | 按级别、状态、类型筛选，关键词搜索，批量确认，右侧详情含脱敏值、上下文与文件定位 |
 | 检测规则 | 内置规则逐条开关，在线测试文本（结果同样只显示脱敏值） |
-| 设置 | 扫描目录、大小上限、线程数、通知策略、保留天数、开机自启、直接编辑 `config.toml` |
+| 设置 | 扫描目录、大小上限、线程数、通知策略、syslog 外发、保留天数、开机自启、直接编辑 `config.toml` |
 
 设计取舍：
 
@@ -158,6 +161,17 @@ renotify_cooldown_secs = 600    # 同一文件重复提醒冷却时间
 [storage]
 store_raw_match = false         # 默认只存脱敏值
 
+[syslog]                        # 命中后外发到日志服务端（默认关闭）
+enabled = false
+protocol = "udp"                # udp | tcp | unix
+server = "10.0.0.5:514"         # host:port；mdns 模式下可留空
+discovery = "static"            # static | mdns（局域网自动发现）
+mdns_service = "_datasentinel._udp.local."
+facility = "auth"
+min_severity = "medium"
+include_snippet = true
+send_raw = false                # 默认只发脱敏值
+
 [rules]
 disabled = ["cn_landline"]
 min_severity = "low"
@@ -181,6 +195,103 @@ validator = "none"
   `landline`、`social_security`、`passport`、`placeholder`、`entropy:3.2`，可逗号组合。
 - `keywords` 要求命中附近出现任一关键词，用于降低误报。
 
+## Syslog 外发
+
+把命中结果以 RFC 5424 报文推送到日志服务端（rsyslog / syslog-ng / SIEM / 自建采集器）。
+
+```toml
+[syslog]
+enabled = true
+protocol = "udp"                # udp 开销最小；tcp 可靠、自动重连；unix 仅本机
+server = "10.0.0.5:514"         # 必须是 host:port
+facility = "auth"               # auth / daemon / local0-local7 ...
+min_severity = "medium"         # 只外发该级别及以上
+hostname = ""                   # 空 = 本机主机名
+app_name = "DataSentinel"
+include_snippet = true          # 附带脱敏后的上下文行
+send_raw = false                # 默认只发脱敏值
+timeout_ms = 2000
+```
+
+报文形如：
+
+```
+<35>1 2026-11-25T12:02:38.317Z host01 DataSentinel 59635 - [datasentinel@32473 event="cn_id_card" severity="high" host="host01"] {"event":"finding","rule_id":"cn_id_card","rule_name":"中国大陆居民身份证号","severity":"high","path":"/home/u/a.txt","line":2,"value":"320102********0016","masked":"320102********0016",...}
+```
+
+行为约定：
+
+- **只推送新增命中**：未变化文件不会重复外发；`value` 字段默认是脱敏值，`send_raw = true` 才会变成原文，控制台会二次确认。
+- **外发不阻塞扫描**：发送走独立线程与有界队列，网络异常只记 `WARN` 与统计，扫描照常完成。
+- **服务端可配置**：`server` 支持 `host:port` 与 IPv6 `[::1]:514`；`protocol = "unix"` 时填套接字路径。
+- **连通性自测**：`sentinel syslog test` 发一条测试报文；本机没有采集器时可用 `sentinel syslog serve` 起一个最小接收端，它会打印报文并落到数据目录 `syslog/received.log`。
+
+### 零配置：mDNS 自动发现服务端
+
+不想在每台客户端上填 IP 时，用 mDNS/DNS-SD 让客户端自动找到服务端。
+
+**服务端**（`sentinel syslog serve` 默认就会广播）：
+
+```toml
+[syslog_server]
+enabled = true
+protocol = "udp"
+bind = "0.0.0.0:5514"
+advertise = true                                   # 通过 mDNS 广播自己
+mdns_service = "_datasentinel._udp.local."          # 客户端必须用同一个
+instance = ""                                      # 空 = DataSentinel-<主机名>
+```
+
+**客户端**（完全不写 IP）：
+
+```toml
+[syslog]
+enabled = true
+discovery = "mdns"                                 # 自动发现
+mdns_service = "_datasentinel._udp.local."
+mdns_timeout_ms = 4000
+server = ""                                        # 留空；也可填回落地址
+```
+
+行为说明：
+
+| 场景 | 行为 |
+|---|---|
+| 发现成功 | 从 SRV 记录取端口、从 A/AAAA 记录取 IP，自动拼出 `ip:port` |
+| 服务端声明协议 | 读 TXT 的 `protocol=udp\|tcp`，客户端按服务端实际监听的协议发送 |
+| 发现失败 | 回落到 `server`；`server` 也为空则本批跳过外发并记日志，不影响扫描 |
+| 地址选择 | 局域网 IPv4 优先 → 其他 IPv4 → IPv6；过滤回环、`169.254/16`、IPv6 链路本地 |
+| 缓存 | 结果缓存 30 秒，热路径不反复发查询；发送全部失败时自动失效并重新发现 |
+| 端口占用 | 发现器用短生命周期 daemon，用完即关，避免长期占用 5353 与 Avahi/Bonjour 争用 |
+
+排查命令：
+
+```bash
+sentinel syslog discover            # 打印发现的实例、地址、协议
+sentinel syslog discover --service _datasentinel._udp.local. --timeout-ms 8000
+```
+
+支持矩阵（三平台均已适配，差异只在端口复用语义）：
+
+| 平台 | mDNS 收发 | 是否需装 Avahi/Bonjour | 同机自测 | 备注 |
+|---|---|---|---|---|
+| Windows 10/11 | 内置 | 不需要 | ✅ 稳定 | `SO_REUSEADDR` 允许多进程同时收包 |
+| 银河麒麟 / Linux | 内置 | 不需要 | ⚠️ 可能与 Avahi 抢包 | 跨机器正常；单机自测建议填静态地址 |
+| macOS | 内置 | 不需要 | ⚠️ 与 mDNSResponder 分包子 | 跨机器正常 |
+
+> 注意：mDNS 只在一个广播域（同一 VLAN/子网）内有效，无法跨路由。跨网段部署仍需 `discovery = "static"` 配合 DNS 或固定 IP。企业网络若禁用了组播，也会自动回落到静态地址。
+>
+> 防火墙放行：Windows 首次运行勾选「专用网络」；Linux `firewall-cmd --add-service=mdns` 或 `ufw allow 5353/udp`。
+
+对接 rsyslog 的示例（服务端 `/etc/rsyslog.conf`）：
+
+```
+module(load="imudp")
+input(type="imudp" port="514")
+template(name="dsJson" type="string" string="%msg%\n")
+local4.* /var/log/datasentinel.log;dsJson
+```
+
 ## 平台说明
 
 三种平台的控制台都用系统默认浏览器打开（Windows 默认浏览器 / macOS Safari / 麒麟自带浏览器），不需要额外安装运行时。
@@ -202,13 +313,16 @@ powershell -ExecutionPolicy Bypass -File .\build-windows.ps1
 - Toast 通过 PowerShell + WinRT 发送（`-EncodedCommand`，不落地临时脚本，不受脚本执行策略影响）；极端情况下回退 `msg`。
 - 自启优先写入任务计划（登录后延迟 30 秒），失败回退 `HKCU\...\Run`。
 - 任务计划以控制台程序启动时可能闪现一次窗口；后续可替换为托盘程序或 `windows_subsystem` 包装器。
+- **mDNS 自动发现无需安装 Bonjour**：内置纯 Rust 实现，直接收发 5353 组播。Windows 的 `SO_REUSEADDR` 允许多个进程同时收到同一个组播包，所以和系统自带的 mDNS 服务共存比 Unix 更稳。防火墙首次运行时可能弹出「允许网络访问」，请勾选**专用网络**；若被策略拦截，会自动回落到静态地址。
+- 若企业策略禁用组播（域控防火墙常见），`sentinel syslog discover` 会返回未发现，此时改用 `discovery = "static"` 填固定 IP。
 
 ### macOS
 
 - Intel / Apple Silicon 均可编译。
-- 默认 `notify.macos_mode = "auto"`：中危及以上的命中使用 `osascript display alert` 系统对话框，**不会被“专注模式/勿扰”静默拦截**；低危走通知中心。
+- **macOS 通知**：默认 `notify.macos_mode = "auto"`：中危及以上的命中使用 `osascript display alert` 系统对话框，**不会被“专注模式/勿扰”静默拦截**；低危走通知中心。
 - 如需只用横幅通知，设置 `macos_mode = "notification"`，并在“系统设置 → 通知 → Script Editor”中允许通知；同时关闭专注模式。
 - 自启写入 `~/Library/LaunchAgents/com.datasentinel.scanner.plist`。
+- **mDNS 自动发现**：系统自带 mDNSResponder 会常驻占用 5353。macOS 的 `SO_REUSEPORT` 采用负载均衡语义（不是复制），本机自测时可能出现「自己发现不到自己」，跨机器正常。需要本机验证时建议用 `discovery = "static"` 或换一台机器测试。
 
 ### 银河麒麟 / Linux
 
@@ -218,6 +332,10 @@ powershell -ExecutionPolicy Bypass -File .\build-windows.ps1
 - 建议在目标发行版或较老的 glibc 环境中编译（或使用 musl 静态构建），避免跨发行版 glibc 不兼容。
 - 中文目录通过读取 `~/.config/user-dirs.dirs` 自动识别（桌面/文档/下载）。
 - 大规模目录可能触及 `inotify` 的 `max_user_watches` 上限；监听失败会记录日志，并由启动/定时对账兜底。
+- **mDNS 自动发现**：不依赖 Avahi 守护进程，直接收发 5353 组播；与 Avahi 共存靠 `SO_REUSEPORT`。
+  - 若系统已启用 Avahi 且占用了 5353，内核会把组播包分发给其中一个监听者，可能出现「本机自己发现不到自己」。跨机器发现不受影响；单机自测建议直接填 `server` 或用 `discovery = "static"`。
+  - firewalld 默认放行 mDNS：`firewall-cmd --add-service=mdns --permanent`；ufw 需要 `ufw allow 5353/udp`。
+  - 容器/虚拟机环境若做了组播隔离，同样会回落到静态地址。
 
 ## 架构与性能
 
@@ -246,7 +364,10 @@ powershell -ExecutionPolicy Bypass -File .\build-windows.ps1
 - 默认只保存脱敏值；`storage.store_raw_match = true` 才会保存原文（不建议）。
 - 数据库、报告、配置在 Unix 上以 `0600` 写入，目录 `0700`。
 - 自动排除自身数据库/日志/报告目录。
-- 全部检测、存储、通知在本地完成，无网络请求。
+- 默认全程离线：不扫描、不存储、不外发都只在本机完成。**只有显式开启 `[syslog] enabled = true` 才会产生网络流量**，且默认只发送脱敏值；`send_raw = true` 需要用户二次确认。
+- syslog 走明文 UDP/TCP，不含加密；跨不可信网络时请在服务端用 rsyslog `imtcp + gtls` 或隧道（WireGuard / stunnel）保护链路。
+- 接收端日志同样以 `0600` 落盘。
+- mDNS 自动发现只广播「服务名 + IP + 端口 + 协议」，不携带任何命中数据；但它会把本机在局域网内暴露为可发现节点，保密环境可设 `advertise = false` 并改用静态地址。
 
 ## 测试
 
@@ -254,7 +375,7 @@ powershell -ExecutionPolicy Bypass -File .\build-windows.ps1
 cargo test
 ```
 
-覆盖：身份证校验位/行政区划、银行卡 BIN + Luhn、手机号号段、座机区号、社保卡号标签联动、占位符、编码识别、分块边界、规则引擎、SQLite 去重/确认状态，以及时间戳/订单号/雪花 ID 等常见数字噪声的误报回归。
+覆盖：身份证校验位/行政区划、银行卡 BIN + Luhn、手机号号段、座机区号、社保卡号标签联动、占位符、编码识别、分块边界、规则引擎、SQLite 去重/确认状态、syslog 外发（脱敏、去重、UDP/TCP、mDNS 自动发现与回落），以及时间戳/订单号/雪花 ID 等常见数字噪声的误报回归。
 
 ## 目录结构
 
@@ -265,6 +386,8 @@ src/
   config.rs      配置与常用目录探测
   model.rs       Finding / 统计模型
   rules/         规则集、内置规则、本地区划/卡 BIN 常量表、校验器
+  syslog.rs      RFC 5424 外发、异步队列、接收端
+  mdns.rs        mDNS/DNS-SD 自动发现与广播
   detect.rs      编码、二进制嗅探、Office 抽取
   scan.rs        遍历、并行、增量台账
   watch.rs       notify 监听与去抖

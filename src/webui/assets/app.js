@@ -1295,8 +1295,121 @@
         )
       ]) +
 
-      section('存储与隐私', '默认只保存脱敏值；数据库位于本机用户数据目录', [
+      section('Syslog 外发', '把命中的敏感数据以 RFC 5424 报文推送到日志服务端；默认只发脱敏值', [
         rowHtml(
+          '启用 syslog 外发',
+          '关闭时完全不走网络；开启后仅推送新增命中',
+          switchHtml('syslog.enabled', data.syslog.enabled)
+        ),
+        rowHtml(
+          '服务端地址',
+          data.syslog.discovery === 'mdns'
+            ? '当前使用 mDNS 自动发现，无需填写；下方 server 仅作为发现失败时的回落地址'
+            : '格式 host:port，例如 10.0.0.5:514 或 log.corp.local:5514',
+          '<input class="input" style="width:260px" type="text" placeholder="10.0.0.5:514" value="' +
+            attr(data.syslog.server) +
+            '" data-setting="syslog.server">'
+        ),
+        rowHtml(
+          '地址发现方式',
+          'static 手填地址；mdns 在局域网自动发现服务端（服务端需开启广播）',
+          selectHtml('syslog.discovery', data.syslog.discovery, [
+            ['static', '手动填写'],
+            ['mdns', 'mDNS 自动发现']
+          ])
+        ),
+        rowHtml(
+          'mDNS 服务类型',
+          '需与服务端 <code>syslog_server.mdns_service</code> 一致',
+          '<input class="input" style="width:260px" type="text" value="' +
+            attr(data.syslog.mdns_service) +
+            '" data-setting="syslog.mdns_service">'
+        ),
+        rowHtml(
+          '发现超时',
+          '超时后回落到手动填写的地址；结果会缓存 30 秒',
+          '<input class="input narrow" type="number" min="500" value="' +
+            data.syslog.mdns_timeout_ms +
+            '" data-setting="syslog.mdns_timeout_ms"> <span class="small muted">毫秒</span>'
+        ),
+        rowHtml(
+          '查找服务端',
+          '在本机发起一次 mDNS 查询，结果仅用于确认，不会自动写入配置',
+          '<button class="btn btn-sm" data-action="discover-syslog">查找服务端</button>'
+        ),
+        rowHtml(
+          '传输协议',
+          'udp 开销最小；tcp 可靠、自动重连；unix 仅本机套接字',
+          selectHtml('syslog.protocol', data.syslog.protocol, [
+            ['udp', 'UDP'],
+            ['tcp', 'TCP']
+          ])
+        ),
+        rowHtml(
+          '最低外发级别',
+          '低于该级别的命中只记录在本地，不外发',
+          selectHtml('syslog.min_severity', data.syslog.min_severity, [
+            ['low', '低危'],
+            ['medium', '中危'],
+            ['high', '高危'],
+            ['critical', '严重']
+          ])
+        ),
+        rowHtml(
+          'Syslog facility',
+          'RFC 5424 设备类别，多数采集器按 facility 分流',
+          selectHtml('syslog.facility', data.syslog.facility, [
+            ['auth', 'auth'],
+            ['authpriv', 'authpriv'],
+            ['daemon', 'daemon'],
+            ['user', 'user'],
+            ['local0', 'local0'],
+            ['local1', 'local1'],
+            ['local2', 'local2'],
+            ['local3', 'local3'],
+            ['local4', 'local4'],
+            ['local5', 'local5'],
+            ['local6', 'local6'],
+            ['local7', 'local7']
+          ])
+        ),
+        rowHtml(
+          '附带上下文片段',
+          '随报文带上脱敏后的同一行文字，便于服务端定位',
+          switchHtml('syslog.include_snippet', data.syslog.include_snippet)
+        ),
+        rowHtml(
+          '外发命中原文',
+          '默认关闭。开启后报文里的 value 字段将是敏感数据明文，请确认链路可信',
+          switchHtml('syslog.send_raw', data.syslog.send_raw)
+        ),
+        rowHtml(
+          '发送超时',
+          '单条报文发送超时；超时只记日志，不会阻塞扫描',
+          '<input class="input narrow" type="number" min="200" value="' +
+            data.syslog.timeout_ms +
+            '" data-setting="syslog.timeout_ms"> <span class="small muted">毫秒</span>'
+        ),
+        rowHtml(
+          '测试 syslog 链路',
+          '向当前服务端地址发送一条测试报文，确认网络与采集器可用',
+          '<button class="btn btn-sm" data-action="test-syslog">发送测试报文</button>'
+        ),
+        rowHtml(
+          '本机接收端',
+          '自测用：<code>sentinel syslog serve</code> 默认监听 ' +
+            esc(data.syslog.server_bind) +
+            '（' +
+            esc(data.syslog.server_protocol) +
+            '），' +
+            (data.syslog.server_advertise
+              ? '并通过 mDNS 广播，客户端可自动发现'
+              : '未开启 mDNS 广播'),
+          '<span class="small muted">命令行启动</span>'
+        )
+      ]) +
+
+      section('存储与隐私', '默认只保存脱敏值；数据库位于本机用户数据目录', [        rowHtml(
           '记录保留天数',
           '超期记录会在下次扫描时清理；0 表示永久保留',
           '<input class="input narrow" type="number" min="0" value="' +
@@ -1943,6 +2056,41 @@
             toast(error.message, { type: 'error' });
           });
         break;
+      case 'test-syslog':
+        api('/api/syslog/test', { method: 'POST', body: {} })
+          .then(function (result) {
+            toast('测试报文已发送到 ' + result.server + '（' + result.protocol + '）');
+          })
+          .catch(function (error) {
+            toast(error.message, { type: 'error', duration: 6000 });
+          });
+        break;
+      case 'discover-syslog':
+        api('/api/syslog/discover', { method: 'POST', body: {} })
+          .then(function (result) {
+            pushModal(
+              '<div class="modal" style="width:480px"><div class="modal-head"><h3>已发现 syslog 服务端</h3>' +
+                '<span class="spacer"></span><button class="icon-btn" data-action="close-modal">' +
+                ICON.close +
+                '</button></div>' +
+                '<div class="modal-body"><div class="small" style="color:var(--text-2);line-height:1.9">' +
+                '实例：<code>' +
+                esc(result.instance) +
+                '</code><br>地址：<code>' +
+                esc(result.endpoint) +
+                '</code>' +
+                (result.protocol ? '<br>协议：<code>' + esc(result.protocol) + '</code>' : '') +
+                '<br>全部地址：' +
+                esc((result.addresses || []).join(', ')) +
+                '<br><br>把「地址发现方式」切换为 <b>mDNS 自动发现</b> 即可，无需填写 IP。' +
+                '</div></div>' +
+                '<div class="modal-foot"><button class="btn btn-primary" data-action="close-modal">知道了</button></div></div>'
+            );
+          })
+          .catch(function (error) {
+            toast(error.message, { type: 'error', duration: 6000 });
+          });
+        break;
       case 'autostart-install':
       case 'autostart-remove': {
         var act = action === 'autostart-install' ? 'install' : 'uninstall';
@@ -2034,6 +2182,20 @@
         confirmDialog(
           '确认保存命中原文？',
           '开启后数据库会以明文保存身份证、密码等敏感值。若本机被入侵，这些数据会被直接读取。建议仅在排查问题时临时开启。',
+          function () {
+            setting.checked = true;
+            saveSetting(key, true).catch(function (error) {
+              toast(error.message, { type: 'error' });
+            });
+          }
+        );
+        return;
+      }
+      if (key === 'syslog.send_raw' && value === true) {
+        setting.checked = false;
+        confirmDialog(
+          '确认外发敏感数据原文？',
+          '开启后 syslog 报文中的 value 字段将是身份证、银行卡等明文，会离开本机。请确认服务端主机、网络链路与访问权限都受控。',
           function () {
             setting.checked = true;
             saveSetting(key, true).catch(function (error) {

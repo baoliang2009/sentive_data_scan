@@ -52,6 +52,8 @@ pub fn handle(request: &Request, ctx: &AppContext) -> Response {
         ("POST", "/api/report") => export_report(ctx, request),
         ("POST", "/api/autostart") => autostart_action(ctx, request),
         ("POST", "/api/notify/test") => notify_test(ctx),
+        ("POST", "/api/syslog/test") => syslog_test(ctx, request),
+        ("POST", "/api/syslog/discover") => syslog_discover(ctx, request),
         ("GET", "/api/settings") => get_settings(ctx),
         ("POST", "/api/settings") => save_settings(ctx, request),
         ("GET", "/api/config") => get_config(ctx),
@@ -752,6 +754,90 @@ fn notify_test(ctx: &AppContext) -> Response {
     }
 }
 
+fn syslog_test(ctx: &AppContext, request: &Request) -> Response {
+    let config = match ctx.load_config() {
+        Ok(config) => config,
+        Err(error) => return fail(error),
+    };
+    let mut syslog = config.syslog.clone();
+    if let Ok(body) = request.json() {
+        if let Some(server) = body.get("server").and_then(Value::as_str) {
+            if !server.trim().is_empty() {
+                syslog.server = server.trim().to_string();
+            }
+        }
+        if let Some(protocol) = body.get("protocol").and_then(Value::as_str) {
+            if !protocol.trim().is_empty() {
+                syslog.protocol = protocol.trim().to_string();
+            }
+        }
+    }
+    syslog.enabled = true;
+    if syslog.server.trim().is_empty() {
+        return error_response(400, "请先填写 syslog 服务端地址（host:port）");
+    }
+    if !syslog.transport_supported() {
+        return error_response(400, "当前平台的 syslog 协议不受支持");
+    }
+    let Some(sender) = crate::syslog::SyslogSender::from_config(&syslog) else {
+        return error_response(400, "syslog 未启用或地址为空");
+    };
+    match sender.send_test() {
+        Ok(()) => ok(json!({
+            "ok": true,
+            "server": syslog.server,
+            "protocol": syslog.protocol,
+        })),
+        Err(error) => error_response(
+            502,
+            format!(
+                "无法发送到 {}（{}）：{error:#}",
+                syslog.server, syslog.protocol
+            ),
+        ),
+    }
+}
+
+/// 通过 mDNS 自动发现局域网内的 syslog 服务端。
+fn syslog_discover(ctx: &AppContext, request: &Request) -> Response {
+    let config = match ctx.load_config() {
+        Ok(config) => config,
+        Err(error) => return fail(error),
+    };
+    let body = request.json().unwrap_or(Value::Null);
+    let service = body
+        .get("service")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&config.syslog.mdns_service)
+        .to_string();
+    let timeout_ms = body
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(config.syslog.mdns_timeout_ms)
+        .clamp(500, 30_000);
+
+    match crate::mdns::discover(&service, std::time::Duration::from_millis(timeout_ms)) {
+        Ok(Some(found)) => ok(json!({
+            "ok": true,
+            "service": service,
+            "instance": found.instance,
+            "endpoint": found.endpoint,
+            "protocol": found.protocol,
+            "addresses": found.addresses
+                .iter()
+                .map(|addr| addr.to_string())
+                .collect::<Vec<_>>(),
+        })),
+        Ok(None) => error_response(
+            404,
+            format!("未发现 {service}；请确认服务端已启动并在 syslog_server.advertise = true"),
+        ),
+        Err(error) => fail(error),
+    }
+}
+
 fn reveal(_ctx: &AppContext, request: &Request) -> Response {
     let body = match request.json() {
         Ok(body) => body,
@@ -837,6 +923,24 @@ fn get_settings(ctx: &AppContext) -> Response {
             "retention_days": config.storage.retention_days,
             "store_raw_match": config.storage.store_raw_match,
         },
+        "syslog": {
+            "enabled": config.syslog.enabled,
+            "protocol": config.syslog.protocol,
+            "server": config.syslog.server,
+            "facility": config.syslog.facility,
+            "min_severity": config.syslog.min_severity.as_str(),
+            "hostname": config.syslog.hostname,
+            "app_name": config.syslog.app_name,
+            "include_snippet": config.syslog.include_snippet,
+            "send_raw": config.syslog.send_raw,
+            "timeout_ms": config.syslog.timeout_ms,
+            "discovery": config.syslog.discovery,
+            "mdns_service": config.syslog.mdns_service,
+            "mdns_timeout_ms": config.syslog.mdns_timeout_ms,
+            "server_bind": config.syslog_server.bind,
+            "server_protocol": config.syslog_server.protocol,
+            "server_advertise": config.syslog_server.advertise,
+        },
         "rules": {
             "min_severity": config.rules.min_severity.as_str(),
             "disabled": config.rules.disabled,
@@ -885,6 +989,11 @@ fn save_settings(ctx: &AppContext, request: &Request) -> Response {
     if let Some(storage) = body.get("storage") {
         for (key, value) in storage_object(storage) {
             push("storage", &key, &value);
+        }
+    }
+    if let Some(syslog) = body.get("syslog") {
+        for (key, value) in syslog_object(syslog) {
+            push("syslog", &key, &value);
         }
     }
     if let Some(rules) = body.get("rules") {
@@ -959,6 +1068,34 @@ fn notify_object(value: &Value) -> Vec<(String, Value)> {
         "macos_mode",
         "renotify_modified",
         "renotify_cooldown_secs",
+    ] {
+        if let Some(value) = map.get(key) {
+            out.push((key.to_string(), value.clone()));
+        }
+    }
+    out
+}
+
+fn syslog_object(value: &Value) -> Vec<(String, Value)> {
+    let map = match value.as_object() {
+        Some(map) => map,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for key in [
+        "enabled",
+        "protocol",
+        "server",
+        "facility",
+        "min_severity",
+        "hostname",
+        "app_name",
+        "include_snippet",
+        "send_raw",
+        "timeout_ms",
+        "discovery",
+        "mdns_service",
+        "mdns_timeout_ms",
     ] {
         if let Some(value) = map.get(key) {
             out.push((key.to_string(), value.clone()));
