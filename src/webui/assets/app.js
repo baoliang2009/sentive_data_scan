@@ -1255,7 +1255,7 @@
         )
       ]) +
 
-      section('通知', '命中后通过系统通知提醒（Windows Toast / macOS 通知中心 / notify-send）', [
+      section('通知', '文件落盘保存命中敏感数据时通过系统通知提醒（扫描任务不弹窗）', [
         rowHtml('启用桌面通知', '关闭后只记录不提醒', switchHtml('notify.enabled', data.notify.enabled)),
         rowHtml(
           '最低通知级别',
@@ -1631,7 +1631,7 @@
 
   function openScanModal() {
     if (state.overview && state.overview.roots) {
-      state.scanDraft = { paths: state.overview.roots.slice(), force: false, notify: true };
+      state.scanDraft = { paths: state.overview.roots.slice(), force: false };
       renderScanModal();
       return;
     }
@@ -1640,8 +1640,7 @@
         state.settings = data;
         state.scanDraft = {
           paths: (data.scan.effective_roots || []).slice(),
-          force: false,
-          notify: true
+          force: false
         };
         renderScanModal();
       })
@@ -1651,7 +1650,7 @@
   }
 
   function renderScanModal() {
-    var draft = state.scanDraft || { paths: [], force: false, notify: true };
+    var draft = state.scanDraft || { paths: [], force: false };
     var html =
       '<div class="modal"><div class="modal-head"><h3>开始扫描</h3><span class="spacer"></span>' +
       '<button class="icon-btn" data-action="close-modal">' +
@@ -1681,9 +1680,6 @@
       '<div class="form-row"><label class="checkbox"><input type="checkbox" id="scan-force"' +
       (draft.force ? ' checked' : '') +
       '><span>强制全量重扫<span class="hint">忽略增量台账，逐个文件重新检测（耗时更长）</span></span></label></div>' +
-      '<div class="form-row"><label class="checkbox"><input type="checkbox" id="scan-notify"' +
-      (draft.notify ? ' checked' : '') +
-      '><span>完成后发送系统通知<span class="hint">按通知设置聚合提醒</span></span></label></div>' +
       '</div>' +
       '<div class="modal-foot"><button class="btn" data-action="close-modal">取消</button>' +
       '<button class="btn btn-primary" data-action="start-scan">开始扫描</button></div></div>';
@@ -1696,11 +1692,9 @@
 
   function startScan() {
     var forceEl = $('#scan-force');
-    var notifyEl = $('#scan-notify');
     var body = {
       paths: (state.scanDraft && state.scanDraft.paths) || [],
-      force: !!(forceEl && forceEl.checked),
-      notify: !(notifyEl && !notifyEl.checked)
+      force: !!(forceEl && forceEl.checked)
     };
     closeAllModals();
     api('/api/scan/start', { method: 'POST', body: body })

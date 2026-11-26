@@ -112,6 +112,15 @@ pre,
   background-clip: content-box;
 }
 
+/* HTML `hidden` 属性必须始终生效。
+ *
+ * 浏览器默认样式只是 `[hidden] { display: none }`，优先级低于任何类选择器；
+ * 而 `.app` / `.nav-count` 等都显式写了 `display`，于是 JS 设置
+ * `el.hidden = true` 后元素依然可见。这里用 !important 兜住所有情况。 */
+[hidden] {
+  display: none !important;
+}
+
 /* ------------------------------------------------------------------ shell */
 
 .app {

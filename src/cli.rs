@@ -78,7 +78,7 @@ pub struct ScanArgs {
     #[arg(long)]
     pub force: bool,
 
-    /// 扫描完成不弹桌面通知
+    /// 兼容参数：扫描任务默认不弹桌面通知
     #[arg(long)]
     pub no_notify: bool,
 
