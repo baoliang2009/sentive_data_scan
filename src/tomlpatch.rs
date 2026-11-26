@@ -119,3 +119,20 @@ mod tests {
         assert_eq!(toml_literal(&value), "[\"/tmp/a\", \"/tmp/b\"]");
     }
 }
+
+/// 把字符串编码成 TOML 字面量（服务端回写凭据时用）。
+pub fn toml_quote(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+#[cfg(test)]
+mod quote_tests {
+    use super::*;
+
+    #[test]
+    fn quotes_special_characters() {
+        assert_eq!(toml_quote("plain"), "\"plain\"");
+        assert_eq!(toml_quote("a\"b"), "\"a\\\"b\"");
+        assert_eq!(toml_quote("路径"), "\"路径\"");
+    }
+}

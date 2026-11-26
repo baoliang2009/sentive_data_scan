@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>数据哨兵 · 集中管理</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23141a26'/%3E%3Cpath d='M16 7l7 3v6.2c0 3.9-2.8 7.2-7 8.8-4.2-1.6-7-4.9-7-8.8V10l7-3z' fill='none' stroke='%23fff' stroke-width='1.8'/%3E%3Ccircle cx='16' cy='15.5' r='2.4' fill='%23fff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<!-- 登录页 -->
+<div class="auth-wrap" id="auth-view" hidden>
+  <form class="auth-card" id="auth-form" autocomplete="off">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 3l7.5 3v5.6c0 4.3-3.1 8-7.5 9.4-4.4-1.4-7.5-5.1-7.5-9.4V6L12 3z"/>
+          <circle cx="12" cy="11.4" r="2.3"/><path d="M12 13.7v3"/>
+        </svg>
+      </span>
+      <span class="brand-text"><strong>数据哨兵</strong><small>集中管理</small></span>
+    </div>
+    <h1>管理员登录</h1>
+    <p class="muted small">登录后可查看全部终端的敏感数据告警、统一下发检测规则。</p>
+    <label class="field">
+      <span>管理口令</span>
+      <input type="password" id="auth-password" required autofocus placeholder="首次启动时终端会打印初始口令">
+    </label>
+    <p class="auth-error" id="auth-error" hidden></p>
+    <button class="btn btn-primary btn-block" type="submit" id="auth-submit">登录</button>
+    <p class="muted tiny auth-foot">v__VERSION__ · __PLATFORM__</p>
+  </form>
+</div>
+
+<!-- 主界面 -->
+<div class="app" id="app-view" hidden>
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 3l7.5 3v5.6c0 4.3-3.1 8-7.5 9.4-4.4-1.4-7.5-5.1-7.5-9.4V6L12 3z"/>
+          <circle cx="12" cy="11.4" r="2.3"/><path d="M12 13.7v3"/>
+        </svg>
+      </span>
+      <span class="brand-text"><strong>数据哨兵</strong><small>集中管理</small></span>
+    </div>
+
+    <nav class="nav" id="nav">
+      <a class="nav-item" data-route="overview" href="#/overview">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.6"/><rect x="14" y="3" width="7" height="7" rx="1.6"/><rect x="3" y="14" width="7" height="7" rx="1.6"/><rect x="14" y="14" width="7" height="7" rx="1.6"/></svg>
+        <span class="nav-label">总览</span>
+      </a>
+      <a class="nav-item" data-route="users" href="#/users">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 20c0-3 2.5-5.2 5.5-5.2s5.5 2.2 5.5 5.2"/><path d="M16.5 5.5a3 3 0 010 5.7"/><path d="M18 14.8c2 .5 3.5 2.2 3.5 4.4"/></svg>
+        <span class="nav-label">按用户</span>
+      </a>
+      <a class="nav-item" data-route="events" href="#/events">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h10"/><circle cx="19" cy="18" r="2.2"/></svg>
+        <span class="nav-label">告警明细</span>
+        <span class="nav-count" id="nav-count" hidden>0</span>
+      </a>
+      <a class="nav-item" data-route="rules" href="#/rules">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l2.1 4.6 5 .6-3.7 3.4 1 4.9-4.4-2.6-4.4 2.6 1-4.9L4.9 8.2l5-.6L12 3z"/></svg>
+        <span class="nav-label">规则下发</span>
+      </a>
+      <a class="nav-item" data-route="agents" href="#/agents">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>
+        <span class="nav-label">终端</span>
+      </a>
+      <a class="nav-item" data-route="settings" href="#/settings">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.9l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.9-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.9.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.9 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.9l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.9.3H9a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.9-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.9V9a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg>
+        <span class="nav-label">服务设置</span>
+      </a>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="env"><span class="dot"></span><span id="platform-label">__PLATFORM__</span></div>
+      <button class="link-btn" id="logout-btn" type="button">退出登录</button>
+      <div>v<span id="version-label">__VERSION__</span> · 集中管理</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="page-head">
+        <h1 id="page-title">总览</h1>
+        <p id="page-sub">全部终端的敏感数据告警</p>
+      </div>
+      <div class="topbar-actions" id="topbar-actions"></div>
+    </header>
+    <div class="banner-slot" id="banner-slot"></div>
+    <div class="view" id="view"></div>
+  </main>
+</div>
+
+<div class="modal-root" id="modal-root"></div>
+<div class="toast-root" id="toast-root"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

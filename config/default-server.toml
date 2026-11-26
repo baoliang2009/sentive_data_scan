@@ -1,0 +1,53 @@
+# 数据哨兵服务端配置（sentinel-server）
+# 与客户端 config.toml 相互独立。修改后重启服务端生效。
+
+[server]
+# Web 控制台与 HTTP API 监听地址。
+# 默认监听全部网卡，内网部署时请配合防火墙限制来源。
+bind = "0.0.0.0:8443"
+
+[ingest]
+# syslog 接收开关。
+enabled = true
+
+# 监听协议：udp / tcp / both
+protocol = "both"
+
+# syslog 监听地址。标准端口 514 需要 root 或 CAP_NET_BIND_SERVICE。
+bind = "0.0.0.0:5514"
+
+# 允许上报的客户端网段白名单，例如 ["10.0.0.0/8", "192.168.1.0/24"]。
+# 留空表示不限制（仍可通过 Agent Token 鉴权）。
+allow_cidrs = []
+
+# 单条报文最大字节数。
+max_message_bytes = 65536
+
+[storage]
+# SQLite 路径；留空使用平台数据目录下的 server.db。
+database = ""
+
+[auth]
+# Agent 上报与拉取规则使用的共享 Token。
+# 留空时首次启动自动生成，并写入本文件。
+agent_token = ""
+
+# Web 控制台管理口令的 PBKDF2 记录。
+# 留空时首次启动生成随机口令并打印到终端，同时写入本文件。
+# 生成命令：sentinel-server password-hash '你的口令'
+admin_password_hash = ""
+
+# 控制台会话有效期（分钟）。
+session_ttl_minutes = 480
+
+# 是否允许 Agent 不带 Token 读取规则（默认关闭）。
+allow_anonymous_rules = false
+
+[retention]
+# 告警保留天数；0 表示永久保留。
+event_days = 180
+
+[tls]
+# 配置后启用 HTTPS（PEM 格式）。两者需同时填写。
+cert = ""
+key = ""

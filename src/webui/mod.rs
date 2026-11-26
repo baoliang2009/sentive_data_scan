@@ -7,7 +7,13 @@
 
 pub mod api;
 pub mod server;
-mod tomlpatch;
+// tomlpatch 已提升到 crate 根（服务端也用它改写配置）
+pub use crate::tomlpatch;
+
+/// 兼容旧调用：`crate::webui::tomlpatch_set_key`。
+pub fn tomlpatch_set_key(text: &str, section: &str, key: &str, value: &str) -> String {
+    crate::tomlpatch::set_key(text, section, key, &crate::tomlpatch::toml_quote(value))
+}
 
 use std::net::TcpListener;
 use std::path::PathBuf;

@@ -19,7 +19,7 @@ use crate::scan::Scanner;
 use crate::store::Store;
 use crate::util::{format_ts, now_ts};
 use crate::webui::server::{Request, Response};
-use crate::webui::tomlpatch::{set_key, toml_literal};
+use crate::tomlpatch::{set_key, toml_literal};
 use crate::webui::{AppContext, ScanResult};
 
 pub const JSON: &str = "application/json; charset=utf-8";
