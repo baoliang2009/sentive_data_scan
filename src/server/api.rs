@@ -124,6 +124,7 @@ pub fn handle_agent(request: &Request, state: &AppState) -> (u16, &'static str, 
                     "note": document.note,
                     "rule_count": document.rule_count,
                     "rules": document.rules,
+                    "policy": document.policy,
                 })),
                 Ok(None) => {
                     // 尚未发布：返回内置默认规则，客户端可直接使用。
@@ -134,6 +135,7 @@ pub fn handle_agent(request: &Request, state: &AppState) -> (u16, &'static str, 
                         "note": fallback.note,
                         "rule_count": fallback.rule_count,
                         "rules": fallback.rules,
+                        "policy": fallback.policy,
                     }))
                 }
                 Err(error) => fail(error),
@@ -252,10 +254,70 @@ pub fn handle(request: &Request, state: &AppState, actor: &str) -> (u16, &'stati
                     Err(error) => return error_response(400, format!("rules 结构不合法：{error}")),
                 };
             let note = body.get("note").and_then(Value::as_str).unwrap_or("");
-            match state.store.publish_rules(rules, note, actor, true) {
+            let policy = if let Some(policy_val) = body.get("policy") {
+                match serde_json::from_value::<crate::config::AgentPolicy>(policy_val.clone()) {
+                    Ok(policy) => policy,
+                    Err(error) => {
+                        return error_response(400, format!("policy 结构不合法：{error}"));
+                    }
+                }
+            } else {
+                state
+                    .store
+                    .current_rules()
+                    .ok()
+                    .flatten()
+                    .map(|doc| doc.policy)
+                    .unwrap_or_default()
+            };
+            match state.store.publish_bundle(rules, policy, note, actor, true) {
                 Ok(doc) => created(json!({
                     "revision": doc.revision,
                     "rule_count": doc.rule_count,
+                })),
+                Err(error) => error_response(400, format!("{error:#}")),
+            }
+        }
+
+        ("POST", "/api/whitelist") => {
+            let body = match request.json() {
+                Ok(body) => body,
+                Err(error) => return error_response(400, error),
+            };
+            let kind = body.get("kind").and_then(Value::as_str).unwrap_or("");
+            let entry = body.get("value").and_then(Value::as_str).unwrap_or("").trim();
+            if entry.is_empty() {
+                return error_response(400, "白名单内容不能为空");
+            }
+            let current = match state.store.current_rules() {
+                Ok(Some(doc)) => doc,
+                Ok(None) => crate::server::rules::default_rules_document(),
+                Err(error) => return fail(error),
+            };
+            let mut policy = current.policy;
+            match kind {
+                "glob" => {
+                    if !policy.allow_globs.iter().any(|item| item == entry) {
+                        policy.allow_globs.push(entry.to_string());
+                    }
+                }
+                "value" => {
+                    if !policy.allow_values.iter().any(|item| item == entry) {
+                        policy.allow_values.push(entry.to_string());
+                    }
+                }
+                _ => return error_response(400, "kind 必须为 glob 或 value"),
+            }
+            match state.store.publish_bundle(
+                current.rules,
+                policy,
+                &format!("添加白名单：{entry}"),
+                actor,
+                true,
+            ) {
+                Ok(doc) => ok(json!({
+                    "revision": doc.revision,
+                    "policy": doc.policy,
                 })),
                 Err(error) => error_response(400, format!("{error:#}")),
             }

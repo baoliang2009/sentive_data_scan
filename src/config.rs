@@ -26,6 +26,7 @@ pub struct Config {
     pub rules: RulesConfig,
     pub syslog: SyslogConfig,
     pub syslog_server: SyslogServerConfig,
+    pub server: ServerSyncConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,12 +167,63 @@ impl Default for StorageConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RulesConfig {
     pub disabled: Vec<String>,
     pub min_severity: Severity,
     pub custom: Vec<CustomRuleConfig>,
+    pub allow_values: Vec<String>,
+}
+
+/// 客户端连接服务端拉取统一下发策略（扫描目录、定时策略、白名单、规则）的配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerSyncConfig {
+    pub enabled: bool,
+    /// 服务端控制台地址，例如 `https://10.0.0.5:8443`；留空时若 syslog 开启 mDNS 则自动发现。
+    pub url: String,
+    /// 与服务端 `auth.agent_token` 一致的共享凭据。
+    pub agent_token: String,
+    /// 拉取策略间隔（秒）。
+    pub sync_interval_secs: u64,
+    /// 服务端使用自签 TLS 证书且未导入系统信任库时可设为 true。
+    pub insecure_tls: bool,
+}
+
+impl Default for ServerSyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            url: String::new(),
+            agent_token: String::new(),
+            sync_interval_secs: 60,
+            insecure_tls: false,
+        }
+    }
+}
+
+/// 服务端统一下发给客户端的扫描与白名单策略。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentPolicy {
+    pub scan_roots: Vec<String>,
+    pub full_scan_interval_hours: u64,
+    pub scan_on_startup: bool,
+    pub allow_globs: Vec<String>,
+    pub allow_values: Vec<String>,
+}
+
+impl Default for AgentPolicy {
+    fn default() -> Self {
+        Self {
+            scan_roots: Vec::new(),
+            full_scan_interval_hours: 24,
+            scan_on_startup: true,
+            allow_globs: Vec::new(),
+            allow_values: Vec::new(),
+        }
+    }
 }
 
 /// 服务端接收配置（用于 `sentinel syslog-server`）。
@@ -219,6 +271,7 @@ impl Default for RulesConfig {
             disabled: Vec::new(),
             min_severity: Severity::Low,
             custom: Vec::new(),
+            allow_values: Vec::new(),
         }
     }
 }
@@ -303,7 +356,7 @@ impl SyslogConfig {
         }
     }
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CustomRuleConfig {
     pub id: String,
@@ -475,12 +528,44 @@ impl Config {
     }
 
     pub fn effective_roots(&self) -> Vec<PathBuf> {
-        let roots = if self.scan.roots.is_empty() {
-            auto_roots()
-        } else {
-            self.scan.roots.iter().map(|p| expand_path(p)).collect()
-        };
+        // 默认不预设扫描目录，仅扫描本地显式配置或服务端统一下发的目录。
+        let roots: Vec<PathBuf> = self.scan.roots.iter().map(|p| expand_path(p)).collect();
         dedup_paths(roots)
+    }
+
+    /// 将服务端下发的统一策略合并到运行时配置副本中（不改写本地配置文件）。
+    pub fn apply_agent_policy(&self, policy: &AgentPolicy) -> Config {
+        let mut next = self.clone();
+        if !policy.scan_roots.is_empty() {
+            let mut merged = next.scan.roots.clone();
+            for raw in &policy.scan_roots {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let path = PathBuf::from(trimmed);
+                if !merged.contains(&path) {
+                    merged.push(path);
+                }
+            }
+            next.scan.roots = merged;
+        }
+        next.scan.full_scan_interval_hours = policy.full_scan_interval_hours;
+        next.scan.scan_on_startup = policy.scan_on_startup;
+
+        for glob in &policy.allow_globs {
+            let trimmed = glob.trim();
+            if !trimmed.is_empty() && !next.scan.allow_globs.iter().any(|g| g == trimmed) {
+                next.scan.allow_globs.push(trimmed.to_string());
+            }
+        }
+        for val in &policy.allow_values {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() && !next.rules.allow_values.iter().any(|v| v == trimmed) {
+                next.rules.allow_values.push(trimmed.to_string());
+            }
+        }
+        next
     }
 
     pub fn watch_roots(&self) -> Vec<PathBuf> {
@@ -812,5 +897,24 @@ mod tests {
     fn expands_home() {
         let home = dirs::home_dir().unwrap();
         assert_eq!(expand_path(Path::new("~/abc")), home.join("abc"));
+    }
+
+    #[test]
+    fn default_roots_empty_and_policy_applies() {
+        let cfg = Config::default();
+        assert!(cfg.effective_roots().is_empty());
+        let policy = AgentPolicy {
+            scan_roots: vec!["~/Desktop".to_string()],
+            full_scan_interval_hours: 12,
+            scan_on_startup: false,
+            allow_globs: vec!["**/ignore/**".to_string()],
+            allow_values: vec!["13800138000".to_string()],
+        };
+        let merged = cfg.apply_agent_policy(&policy);
+        assert_eq!(merged.effective_roots().len(), 1);
+        assert_eq!(merged.scan.full_scan_interval_hours, 12);
+        assert!(!merged.scan.scan_on_startup);
+        assert!(merged.scan.allow_globs.contains(&"**/ignore/**".to_string()));
+        assert!(merged.rules.allow_values.contains(&"13800138000".to_string()));
     }
 }

@@ -76,9 +76,20 @@ fn run(cli: Cli) -> Result<()> {
         Command::NotifyTest => Notifier::new(&config.notify).test(),
         Command::Scan(args) => {
             let store = open_store(&config)?;
-            let rules = RuleSet::build(&config.rules)?;
-            let scanner = Scanner::new(Arc::new(config.clone()), store, rules)?;
-            let roots = resolve_scan_roots(&config, &args);
+            let bundle = data_sentinel::sync::fetch_policy(&config)
+                .ok()
+                .flatten()
+                .or_else(|| data_sentinel::sync::load_cached(&store));
+            let effective_config = match &bundle {
+                Some(b) => {
+                    let _ = data_sentinel::sync::save_cached(&store, b);
+                    data_sentinel::sync::apply_bundle(&config, b)
+                }
+                None => config.clone(),
+            };
+            let rules = RuleSet::build(&effective_config.rules)?;
+            let scanner = Scanner::new(Arc::new(effective_config.clone()), store, rules)?;
+            let roots = resolve_scan_roots(&effective_config, &args);
             let summary = scanner.scan_roots(&roots, args.force);
             print_summary(&summary, args.json)?;
             // 短命进程：等外发队列排空再退出，避免刚启动就丢报文。

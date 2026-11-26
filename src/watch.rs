@@ -48,66 +48,120 @@ pub fn run_detached(config: Arc<Config>, scanner: Arc<Scanner>, notifier: Notifi
     run_loop(config, scanner, notifier, Arc::new(AtomicBool::new(true)))
 }
 
-fn run_loop(
-    config: Arc<Config>,
-    scanner: Arc<Scanner>,
-    notifier: Notifier,
-    running: Arc<AtomicBool>,
-) -> Result<()> {
-    let scan_roots = config.effective_roots();
-    let watch_roots: Vec<PathBuf> = config
+fn build_watcher(
+    watch_roots: &[PathBuf],
+) -> Result<(
+    notify::RecommendedWatcher,
+    std::sync::mpsc::Receiver<notify::Result<Event>>,
+    Arc<AtomicU64>,
+)> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+    let dropped = Arc::new(AtomicU64::new(0));
+    let dropped_in_callback = Arc::clone(&dropped);
+    let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
+        match tx.try_send(result) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                dropped_in_callback.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => {}
+        }
+    })?;
+
+    let mut watched = 0usize;
+    for root in watch_roots {
+        if !root.exists() {
+            tracing::warn!(path = %root.display(), "监听目录不存在，已跳过");
+            continue;
+        }
+        match watcher.watch(root, RecursiveMode::Recursive) {
+            Ok(()) => {
+                watched += 1;
+                tracing::info!(path = %root.display(), "开始监听目录");
+            }
+            Err(error) => {
+                tracing::warn!(path = %root.display(), error = %error, "监听目录失败");
+            }
+        }
+    }
+    if watched == 0 && !watch_roots.is_empty() {
+        tracing::warn!("没有成功监听任何目录，将只依赖定时对账");
+    }
+    Ok((watcher, rx, dropped))
+}
+
+fn canonical_watch_roots(config: &Config) -> Vec<PathBuf> {
+    config
         .watch_roots()
         .into_iter()
         .map(|path| dunce::canonicalize(&path).unwrap_or(path))
-        .collect();
+        .collect()
+}
+
+fn scan_interval(config: &Config) -> Option<Duration> {
+    if config.scan.full_scan_interval_hours == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(
+            config.scan.full_scan_interval_hours.saturating_mul(3600),
+        ))
+    }
+}
+
+fn run_loop(
+    base_config: Arc<Config>,
+    mut scanner: Arc<Scanner>,
+    notifier: Notifier,
+    running: Arc<AtomicBool>,
+) -> Result<()> {
+    let store = Arc::clone(&scanner.store);
+    let mut current_bundle = crate::sync::load_cached(&store);
+    match crate::sync::fetch_policy(&base_config) {
+        Ok(Some(bundle)) => {
+            if current_bundle.as_ref() != Some(&bundle) {
+                if let Err(error) = crate::sync::save_cached(&store, &bundle) {
+                    tracing::warn!(error = %error, "缓存服务端策略失败");
+                }
+            }
+            current_bundle = Some(bundle);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(error = %error, "启动拉取服务端策略失败，将使用本地缓存/配置");
+        }
+    }
+
+    let mut active_config = if let Some(bundle) = &current_bundle {
+        let merged = Arc::new(crate::sync::apply_bundle(&base_config, bundle));
+        if let Ok(rules) = crate::rules::RuleSet::build(&merged.rules) {
+            if let Ok(next_scanner) = Scanner::new(Arc::clone(&merged), Arc::clone(&store), rules) {
+                scanner = Arc::new(next_scanner);
+            }
+        }
+        if let Ok(identity) = crate::identity::Identity::load_or_create(&store, &merged) {
+            let _ = crate::sync::report_revision(&base_config, &identity, bundle.revision);
+        }
+        merged
+    } else {
+        Arc::clone(&base_config)
+    };
+
+    let mut scan_roots = active_config.effective_roots();
+    let mut watch_roots = canonical_watch_roots(&active_config);
     tracing::info!(
         scan_roots = ?scan_roots,
         watch_roots = ?watch_roots,
         "数据哨兵守护进程启动"
     );
 
-    let (mut watcher, receiver) = if config.watch.enabled {
-        let (tx, rx) = std::sync::mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
-        let dropped = Arc::new(AtomicU64::new(0));
-        let dropped_in_callback = Arc::clone(&dropped);
-        let watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
-            match tx.try_send(result) {
-                Ok(()) => {}
-                // 队列满：丢弃事件但保留计数，避免内存被拖垮。
-                Err(TrySendError::Full(_)) => {
-                    dropped_in_callback.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(TrySendError::Disconnected(_)) => {}
-            }
-        })?;
-        (Some(watcher), Some((rx, dropped)))
+    let (mut _watcher, mut receiver) = if active_config.watch.enabled {
+        let (w, rx, dropped) = build_watcher(&watch_roots)?;
+        (Some(w), Some((rx, dropped)))
     } else {
         (None, None)
     };
 
-    if let Some(watcher) = watcher.as_mut() {
-        let mut watched = 0usize;
-        for root in &watch_roots {
-            if !root.exists() {
-                tracing::warn!(path = %root.display(), "监听目录不存在，已跳过");
-                continue;
-            }
-            match watcher.watch(root, RecursiveMode::Recursive) {
-                Ok(()) => {
-                    watched += 1;
-                    tracing::info!(path = %root.display(), "开始监听目录");
-                }
-                Err(error) => {
-                    tracing::warn!(path = %root.display(), error = %error, "监听目录失败");
-                }
-            }
-        }
-        if watched == 0 {
-            tracing::warn!("没有成功监听任何目录，将只依赖定时对账");
-        }
-    }
-
-    if config.scan.scan_on_startup || scanner.rules_changed() {
+    if (active_config.scan.scan_on_startup || scanner.rules_changed()) && !scan_roots.is_empty() {
         if scanner.rules_changed() {
             tracing::info!("检测规则已变化，强制执行一次全量对账");
         }
@@ -115,21 +169,18 @@ fn run_loop(
         let summary = scanner.scan_roots(&scan_roots, false);
         log_summary(&summary, "启动扫描");
         scanner.flush_syslog();
+    } else if scan_roots.is_empty() {
+        tracing::info!("当前未配置扫描目录，等待服务端下发策略");
     }
 
     // 启动即报到：否则一台没有新命中的机器要等到下次落盘命中才会
     // 出现在服务端「终端」页。
     scanner.heartbeat();
 
-    let debounce = Duration::from_millis(config.watch.debounce_ms.max(200));
-    let max_pending = config.watch.max_pending.max(100);
-    let interval = if config.scan.full_scan_interval_hours == 0 {
-        None
-    } else {
-        Some(Duration::from_secs(
-            config.scan.full_scan_interval_hours.saturating_mul(3600),
-        ))
-    };
+    let debounce = Duration::from_millis(active_config.watch.debounce_ms.max(200));
+    let max_pending = active_config.watch.max_pending.max(100);
+    let mut interval = scan_interval(&active_config);
+    let sync_interval = Duration::from_secs(base_config.server.sync_interval_secs.max(10));
 
     let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
     let mut last_full_scan = Instant::now();
@@ -137,6 +188,7 @@ fn run_loop(
     let mut last_log_prune = Instant::now();
     // 心跳：构造 Scanner 时已发过一次，这里负责长期保活。
     let mut last_heartbeat = Instant::now();
+    let mut last_sync = Instant::now();
     let heartbeat_interval = Duration::from_secs(HEARTBEAT_INTERVAL_SECS);
 
     while running.load(Ordering::SeqCst) {
@@ -180,7 +232,7 @@ fn run_loop(
         // 守护进程通常长期不重启，日志需要主动清理。这里不绑定“定时对账”
         // （`full_scan_interval_hours = 0` 时那条分支永不执行），而是每天清一次。
         if last_log_prune.elapsed() >= Duration::from_secs(86_400) {
-            crate::config::prune_old_logs(&config.logs_dir(), crate::config::LOG_RETENTION_DAYS);
+            crate::config::prune_old_logs(&active_config.logs_dir(), crate::config::LOG_RETENTION_DAYS);
             last_log_prune = Instant::now();
         }
 
@@ -190,11 +242,72 @@ fn run_loop(
             last_heartbeat = Instant::now();
         }
 
+        // 定期向服务端拉取统一策略（扫描路径、定时周期、白名单与规则），变化时热更新。
+        if last_sync.elapsed() >= sync_interval {
+            last_sync = Instant::now();
+            match crate::sync::fetch_policy(&base_config) {
+                Ok(Some(bundle)) if current_bundle.as_ref() != Some(&bundle) => {
+                    tracing::info!(revision = bundle.revision, "收到服务端新策略，正在热更新");
+                    let merged = Arc::new(crate::sync::apply_bundle(&base_config, &bundle));
+                    match crate::rules::RuleSet::build(&merged.rules)
+                        .and_then(|rules| Scanner::new(Arc::clone(&merged), Arc::clone(&store), rules))
+                    {
+                        Ok(next_scanner) => {
+                            scanner = Arc::new(next_scanner);
+                            active_config = merged;
+                            scan_roots = active_config.effective_roots();
+                            interval = scan_interval(&active_config);
+                            let next_watch_roots = canonical_watch_roots(&active_config);
+                            if next_watch_roots != watch_roots {
+                                watch_roots = next_watch_roots;
+                                if active_config.watch.enabled {
+                                    match build_watcher(&watch_roots) {
+                                        Ok((w, rx, dropped)) => {
+                                            _watcher = Some(w);
+                                            receiver = Some((rx, dropped));
+                                        }
+                                        Err(error) => {
+                                            tracing::warn!(error = %error, "更新监听目录失败");
+                                        }
+                                    }
+                                }
+                            }
+                            let _ = crate::sync::save_cached(&store, &bundle);
+                            if let Ok(identity) =
+                                crate::identity::Identity::load_or_create(&store, &active_config)
+                            {
+                                let _ = crate::sync::report_revision(
+                                    &base_config,
+                                    &identity,
+                                    bundle.revision,
+                                );
+                            }
+                            current_bundle = Some(bundle);
+                            if !scan_roots.is_empty() {
+                                let summary = scanner.scan_roots(&scan_roots, false);
+                                log_summary(&summary, "策略更新扫描");
+                                scanner.flush_syslog();
+                                last_full_scan = Instant::now();
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %error, "应用服务端新策略失败，保留当前配置");
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::debug!(error = %error, "拉取服务端策略失败");
+                }
+            }
+        }
+
         if let Some(interval) = interval {
-            if last_full_scan.elapsed() >= interval {
+            if !scan_roots.is_empty() && last_full_scan.elapsed() >= interval {
                 tracing::info!("开始定时对账扫描");
                 let summary = scanner.scan_roots(&scan_roots, false);
                 log_summary(&summary, "定时扫描");
+                scanner.flush_syslog();
                 last_full_scan = Instant::now();
             }
         }

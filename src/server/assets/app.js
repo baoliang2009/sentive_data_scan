@@ -492,6 +492,17 @@
     var rows = state.events.length
       ? state.events
           .map(function (event) {
+            var fileName =
+              event.file_name ||
+              (event.path ? String(event.path).split(/[/\\]/).filter(Boolean).pop() : '') ||
+              '—';
+            var loc = event.path ? String(event.path) : '';
+            if (event.line > 0) {
+              loc += (loc ? ' :' : '第 ') + event.line + (event.column > 0 ? ':' + event.column : '') + (loc ? '' : ' 行');
+            }
+            var matchedText = event.matched || event.masked || '—';
+            var hasDistinctMasked =
+              event.matched && event.masked && event.matched !== event.masked;
             return (
               '<tr>' +
               '<td class="cell-sub" style="white-space:nowrap">' +
@@ -515,17 +526,41 @@
               '<div class="rule-id">' +
               esc(event.rule_id) +
               '</div></td>' +
-              '<td class="cell-mono">' +
-              esc(event.masked || '—') +
+              '<td style="max-width:240px">' +
+              '<div><strong>' +
+              esc(fileName) +
+              '</strong></div>' +
+              (loc
+                ? '<div class="cell-sub cell-mono" style="font-size:11px;word-break:break-all">' +
+                  esc(loc) +
+                  '</div>'
+                : '') +
               '</td>' +
-              '<td class="cell-sub" style="max-width:280px">' +
-              esc(event.snippet || event.path || '—') +
+              '<td class="cell-mono" style="max-width:220px;word-break:break-all">' +
+              '<div>' +
+              esc(matchedText) +
+              '</div>' +
+              (hasDistinctMasked
+                ? '<div class="cell-sub" style="font-size:11px">脱敏: ' +
+                  esc(event.masked) +
+                  '</div>'
+                : '') +
+              '</td>' +
+              '<td class="cell-sub" style="max-width:260px;word-break:break-all">' +
+              esc(event.snippet || '—') +
+              '</td>' +
+              '<td style="white-space:nowrap">' +
+              '<button class="btn btn-sm" data-action="whitelist-event" data-path="' +
+              esc(event.path || '') +
+              '" data-value="' +
+              esc(event.matched || event.masked || '') +
+              '">加白名单</button>' +
               '</td>' +
               '</tr>'
             );
           })
           .join('')
-      : '<tr><td colspan="7"><div class="empty">没有符合条件的告警</div></td></tr>';
+      : '<tr><td colspan="9"><div class="empty">没有符合条件的告警</div></td></tr>';
 
     var totalPages = Math.max(1, Math.ceil(state.eventsTotal / state.pageSize));
     var from = state.eventsTotal ? state.page * state.pageSize + 1 : 0;
@@ -542,7 +577,7 @@
       '<select class="select" id="filter-severity"><option value="">全部级别</option>' +
       severities +
       '</select>' +
-      '<input class="input search" id="filter-q" type="search" placeholder="搜脱敏值 / 路径 / 上下文 / 主机" value="' +
+      '<input class="input search" id="filter-q" type="search" placeholder="搜文件名 / 命中内容 / 路径 / 上下文 / 主机" value="' +
       esc(state.filters.q) +
       '">' +
       '<span class="spacer"></span>' +
@@ -550,7 +585,7 @@
       '</div>' +
       '<div class="table-wrap"><table class="grid"><thead><tr>' +
       '<th>时间</th><th>用户 / 主机</th><th>级别</th><th>类型</th><th>规则</th>' +
-      '<th>脱敏值</th><th>内容</th>' +
+      '<th>文件 / 位置</th><th>命中内容</th><th>上下文</th><th>操作</th>' +
       '</tr></thead><tbody>' +
       rows +
       '</tbody></table></div>' +
@@ -735,7 +770,47 @@
       })
       .join('');
 
+    var policy = current.policy || {
+      scan_roots: [],
+      full_scan_interval_hours: 24,
+      scan_on_startup: true,
+      allow_globs: [],
+      allow_values: []
+    };
+
+    var policyCard =
+      '<section class="card"><div class="card-head"><div><h2>客户端统一策略</h2>' +
+      '<div class="small muted" style="margin-top:2px">统一下发扫描路径、定时扫描与白名单；客户端默认不扫描本地目录，以服务端下发为准</div></div>' +
+      '<button class="btn btn-sm btn-primary" data-action="save-policy">保存并发布策略</button></div>' +
+      '<div style="padding:16px;display:grid;gap:14px">' +
+      '<div class="row2">' +
+      '<label class="field"><span>统一扫描路径（每行一个目录，支持 ~/Desktop、$HOME 等）</span>' +
+      '<textarea class="input" id="policy-roots" rows="4" placeholder="~/Desktop&#10;~/Documents">' +
+      esc((policy.scan_roots || []).join('\n')) +
+      '</textarea></label>' +
+      '<div style="display:grid;gap:12px">' +
+      '<label class="field"><span>定时扫描间隔（小时，0 表示关闭定时扫描）</span>' +
+      '<input class="input" type="number" min="0" id="policy-interval" value="' +
+      Number(policy.full_scan_interval_hours == null ? 24 : policy.full_scan_interval_hours) +
+      '"></label>' +
+      '<label class="field" style="flex-direction:row;align-items:center;gap:8px">' +
+      '<input type="checkbox" id="policy-startup"' +
+      (policy.scan_on_startup !== false ? ' checked' : '') +
+      '><span>客户端启动时立即执行一次对账扫描</span></label>' +
+      '</div></div>' +
+      '<div class="row2">' +
+      '<label class="field"><span>路径白名单（glob，每行一条，命中的文件不扫描也不上报）</span>' +
+      '<textarea class="input" id="policy-allow-globs" rows="4" placeholder="**/test/**&#10;*.example">' +
+      esc((policy.allow_globs || []).join('\n')) +
+      '</textarea></label>' +
+      '<label class="field"><span>命中内容白名单（每行一个精确值或脱敏值，命中后不上报）</span>' +
+      '<textarea class="input" id="policy-allow-values" rows="4" placeholder="13800138000&#10;example@example.com">' +
+      esc((policy.allow_values || []).join('\n')) +
+      '</textarea></label>' +
+      '</div></div></section>';
+
     return (
+      policyCard +
       '<section class="card"><div class="card-head"><div><h2>当前规则 v' +
       esc(current.revision || 0) +
       '</h2><div class="small muted" style="margin-top:2px">' +
@@ -772,14 +847,54 @@
     return {
       disabled: (rules.disabled || []).slice(),
       min_severity: rules.min_severity || 'low',
-      custom: (rules.custom || []).slice()
+      custom: (rules.custom || []).slice(),
+      allow_values: (rules.allow_values || []).slice()
     };
   }
 
-  function publishRules(config, note) {
-    return api('/api/rules', { method: 'POST', body: { rules: config, note: note || '' } })
+  function currentPolicyConfig() {
+    var policy = (state.rules && state.rules.policy) || {};
+    var splitLines = function (el) {
+      return (el ? el.value : '')
+        .split(/\r?\n/)
+        .map(function (s) {
+          return s.trim();
+        })
+        .filter(Boolean);
+    };
+    var rootsEl = $('#policy-roots');
+    var intervalEl = $('#policy-interval');
+    var startupEl = $('#policy-startup');
+    var globsEl = $('#policy-allow-globs');
+    var valuesEl = $('#policy-allow-values');
+    if (rootsEl || intervalEl || startupEl || globsEl || valuesEl) {
+      var hours = Number(intervalEl ? intervalEl.value : 24);
+      if (isNaN(hours) || hours < 0) hours = 24;
+      return {
+        scan_roots: splitLines(rootsEl),
+        full_scan_interval_hours: Math.floor(hours),
+        scan_on_startup: startupEl ? !!startupEl.checked : true,
+        allow_globs: splitLines(globsEl),
+        allow_values: splitLines(valuesEl)
+      };
+    }
+    return {
+      scan_roots: (policy.scan_roots || []).slice(),
+      full_scan_interval_hours:
+        policy.full_scan_interval_hours == null ? 24 : policy.full_scan_interval_hours,
+      scan_on_startup: policy.scan_on_startup !== false,
+      allow_globs: (policy.allow_globs || []).slice(),
+      allow_values: (policy.allow_values || []).slice()
+    };
+  }
+
+  function publishRules(config, note, policy) {
+    return api('/api/rules', {
+      method: 'POST',
+      body: { rules: config, policy: policy || currentPolicyConfig(), note: note || '' }
+    })
       .then(function (result) {
-        toast('已发布规则 v' + result.revision + '（' + result.rule_count + ' 条）');
+        toast('已发布策略 v' + result.revision + '（' + result.rule_count + ' 条规则）');
         return loadRules();
       })
       .catch(function (error) {
@@ -1037,7 +1152,9 @@
       '<div class="small muted" style="margin-top:2px">发现本服务端：sentinel syslog discover</div></div></div>' +
       '<div style="padding:16px"><div class="rule-pattern">' +
       esc(
-        '[syslog]\nenabled = true\ndiscovery = "mdns"   # 或填 discovery = "static" 并指定 server\nserver = "<本服务端地址>:5514"'
+        '[syslog]\nenabled = true\ndiscovery = "mdns"   # 或填 discovery = "static" 并指定 server\nserver = "<本服务端地址>:5514"\n\n[server]\nurl = "' +
+          ((config.tls ? 'https://' : 'http://') + (location.host || '<本服务端地址>:8443')) +
+          '"\nagent_token = "<在服务端配置文件 server.toml 中查看>"'
       ) +
       '</div><div class="small muted" style="margin-top:10px">' +
       '客户端拉取规则：GET /api/agent/rules（Authorization: Bearer &lt;Agent Token&gt;）' +
@@ -1182,6 +1299,56 @@
         }
         closeModal();
         publishRules(config, '保存规则 ' + rule.id);
+        break;
+      }
+      case 'save-policy':
+        publishRules(currentRulesConfig(), '更新客户端扫描策略与白名单', currentPolicyConfig());
+        break;
+      case 'whitelist-event': {
+        var evPath = actionEl.dataset.path || '';
+        var evVal = actionEl.dataset.value || '';
+        openModal(
+          '<div class="modal" style="width:500px"><div class="modal-head"><h3>加入白名单</h3><span class="spacer"></span>' +
+            '<button class="icon-btn" data-action="close-modal">✕</button></div>' +
+            '<div class="modal-body" style="display:grid;gap:12px">' +
+            '<p class="small muted">加入白名单并发布后，客户端同步即不再扫描或上报对应误报内容。</p>' +
+            '<label class="field"><span>白名单类型</span><select class="select" id="wl-kind">' +
+            (evVal ? '<option value="value">按命中内容过滤</option>' : '') +
+            (evPath ? '<option value="glob">按文件路径过滤</option>' : '') +
+            '</select></label>' +
+            '<label class="field"><span>匹配值 / 路径规则</span><input class="input" id="wl-value" value="' +
+            esc(evVal || evPath) +
+            '" data-ev-path="' +
+            esc(evPath) +
+            '" data-ev-val="' +
+            esc(evVal) +
+            '"></label>' +
+            '</div><div class="modal-foot"><button class="btn" data-action="close-modal">取消</button>' +
+            '<button class="btn btn-primary" data-action="submit-whitelist">加入并发布</button></div></div>'
+        );
+        var kindSel = $('#wl-kind');
+        var valInput = $('#wl-value');
+        if (kindSel && valInput) {
+          kindSel.addEventListener('change', function () {
+            valInput.value =
+              kindSel.value === 'glob' ? valInput.dataset.evPath || '' : valInput.dataset.evVal || '';
+          });
+        }
+        break;
+      }
+      case 'submit-whitelist': {
+        var wlKind = ($('#wl-kind') || {}).value || 'value';
+        var wlValue = (($('#wl-value') || {}).value || '').trim();
+        if (!wlValue) {
+          toast('白名单内容不能为空', { type: 'error' });
+          break;
+        }
+        api('/api/whitelist', { method: 'POST', body: { kind: wlKind, value: wlValue } })
+          .then(function (res) {
+            closeModal();
+            toast('已加入白名单并发布 v' + res.revision);
+          })
+          .catch(showError);
         break;
       }
       case 'publish-rules':

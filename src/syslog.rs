@@ -202,14 +202,23 @@ impl SyslogSender {
     }
 
     /// 发送一批命中。返回 `(成功条数, 失败条数)`。
-    ///
-    /// 只在 `new_hashes` 里的命中才外发，避免每次全量对账把旧记录重复推一遍。
     pub fn send_findings(&self, path: &Path, findings: &[Finding]) -> (usize, usize) {
+        let (sent, failed, _) = self.send_findings_tracked(path, findings);
+        (sent, failed)
+    }
+
+    /// 发送一批命中，并返回每条成功发送的 `(rule_id, match_hash)` 及目标地址，供上层持久化去重记录。
+    pub fn send_findings_tracked(
+        &self,
+        path: &Path,
+        findings: &[Finding],
+    ) -> (usize, usize, Option<(String, Vec<(String, String)>)>) {
         let Some(target) = self.resolve_target() else {
-            return (0, findings.len());
+            return (0, findings.len(), None);
         };
         let mut sent = 0usize;
         let mut failed = 0usize;
+        let mut acked = Vec::new();
         let timeout = Duration::from_millis(self.config.timeout_ms.max(200));
         let mut transport = match self.transport.lock() {
             Ok(transport) => transport,
@@ -218,7 +227,10 @@ impl SyslogSender {
         for finding in findings {
             let message = self.format_message(path, finding);
             match self.send_one(&mut transport, &target, message.as_bytes(), timeout) {
-                Ok(()) => sent += 1,
+                Ok(()) => {
+                    sent += 1;
+                    acked.push((finding.rule_id.clone(), finding.match_hash.clone()));
+                }
                 Err(error) => {
                     failed += 1;
                     // 同一批里只需要提示一次，避免刷屏。
@@ -240,7 +252,12 @@ impl SyslogSender {
         if should_reinvalidate {
             self.invalidate_target();
         }
-        (sent, failed)
+        let tracked = if acked.is_empty() {
+            None
+        } else {
+            Some((target.server, acked))
+        };
+        (sent, failed, tracked)
     }
 
     /// 发送一条连通性测试报文。
@@ -341,6 +358,10 @@ impl SyslogSender {
         } else {
             &finding.masked
         };
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
         let mut payload = json!({
             "event": "finding",
             "agent_id": self.identity.agent_id,
@@ -351,6 +372,7 @@ impl SyslogSender {
             "rule_name": finding.rule_name,
             "category": finding.category,
             "severity": finding.severity.as_str(),
+            "file_name": file_name,
             "path": path.to_string_lossy(),
             "line": finding.line,
             "column": finding.column,
@@ -566,6 +588,15 @@ impl Forwarder {
 
     /// 同上，但使用调用方提供的终端身份。
     pub fn spawn_with_identity(config: &SyslogConfig, identity: Identity) -> Option<Arc<Self>> {
+        Self::spawn_with_store(config, identity, None)
+    }
+
+    /// 同上，并绑定本地台账，仅在真正发送成功后落盘记录，防止重启重复上报。
+    pub fn spawn_with_store(
+        config: &SyslogConfig,
+        identity: Identity,
+        store: Option<Arc<crate::store::Store>>,
+    ) -> Option<Arc<Self>> {
         let sender = SyslogSender::from_config_with_identity(config, identity)?;
         let min_severity = config.min_severity;
         let mdns = config.uses_mdns();
@@ -611,7 +642,21 @@ impl Forwarder {
                             if qualifying.is_empty() {
                                 continue;
                             }
-                            let (sent, failed) = sender.send_findings(&path, &qualifying);
+                            let (sent, failed, tracked) =
+                                sender.send_findings_tracked(&path, &qualifying);
+                            if let (Some(store), Some((target, acked))) = (&store, tracked) {
+                                for (rule_id, match_hash) in acked {
+                                    if let Err(error) =
+                                        store.mark_reported(&path, &rule_id, &match_hash, &target)
+                                    {
+                                        tracing::warn!(
+                                            path = %path.display(),
+                                            error = %error,
+                                            "写入客户端上报记录失败"
+                                        );
+                                    }
+                                }
+                            }
                             if let Some(forwarder) = counters.upgrade() {
                                 forwarder.sent.fetch_add(sent as u64, Ordering::Relaxed);
                                 forwarder.failed.fetch_add(failed as u64, Ordering::Relaxed);
@@ -923,6 +968,7 @@ mod tests {
         assert!(message.starts_with("<35>1 "), "{message}");
         assert!(message.contains("[datasentinel@32473 event=\"cn_id_card\""));
         assert!(message.contains("severity=\"high\""));
+        assert!(message.contains("\"file_name\":\"a.txt\""));
         assert!(message.contains("\"value\":\"110105********002X\""));
         // 报文必须单行，否则 TCP 读取端会按行拆错。
         assert!(!message.contains('\n'));

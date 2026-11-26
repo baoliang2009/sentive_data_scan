@@ -32,6 +32,7 @@ pub struct RuleSet {
     rules: Vec<CompiledRule>,
     set: Option<RegexSet>,
     min_severity: Severity,
+    allow_values: HashSet<String>,
 }
 
 impl RuleSet {
@@ -76,10 +77,19 @@ impl RuleSet {
             Some(RegexSet::new(patterns.iter().copied()).context("规则集编译失败")?)
         };
 
+        let allow_values: HashSet<String> = config
+            .allow_values
+            .iter()
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .collect();
+
         Ok(Self {
             rules,
             set,
             min_severity: config.min_severity,
+            allow_values,
         })
     }
 
@@ -116,6 +126,12 @@ impl RuleSet {
                 .collect::<Vec<_>>()
                 .join(",");
             material.push_str(&validators);
+        }
+        if !self.allow_values.is_empty() {
+            let mut sorted: Vec<&str> = self.allow_values.iter().map(String::as_str).collect();
+            sorted.sort_unstable();
+            material.push_str("|allow:");
+            material.push_str(&sorted.join(","));
         }
         sha256_hex_str(&material)
     }
@@ -185,6 +201,11 @@ impl RuleSet {
                     }
 
                     let masked = mask_value(&rule.id, value);
+                    if self.allow_values.contains(value.trim())
+                        || self.allow_values.contains(masked.as_str())
+                    {
+                        continue;
+                    }
                     let (line, column) = line_index.line_column(text, absolute_start);
                     let snippet =
                         build_snippet(text, absolute_start, absolute_end, &masked, rule_context);
@@ -499,5 +520,21 @@ mod tests {
         disabled.disabled.push("cn_mobile".to_string());
         let changed = RuleSet::build(&disabled).unwrap();
         assert_ne!(base.fingerprint(), changed.fingerprint());
+    }
+
+    #[test]
+    fn allow_values_filters_exact_and_masked() {
+        let mut config = RulesConfig::default();
+        config.allow_values = vec!["13812345678".to_string()];
+        let rules = RuleSet::build(&config).unwrap();
+        let findings = rules.scan(
+            "手机 13812345678 另一条 13912345678",
+            Path::new("a.txt"),
+            1 << 20,
+            160,
+            false,
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].masked, "139********5678");
     }
 }

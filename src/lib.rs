@@ -20,6 +20,7 @@ pub mod rules;
 pub mod scan;
 pub mod server;
 pub mod store;
+pub mod sync;
 pub mod syslog;
 pub mod tomlpatch;
 pub mod util;

@@ -57,6 +57,18 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS reported_events (
+    dedupe_key  TEXT PRIMARY KEY,
+    path        TEXT NOT NULL,
+    rule_id     TEXT NOT NULL,
+    match_hash  TEXT NOT NULL,
+    target      TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'sent',
+    reported_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_reported_path ON reported_events(path);
 "#;
 
 #[derive(Debug, Clone, Copy)]
@@ -509,6 +521,46 @@ impl Store {
         )?;
         Ok(removed)
     }
+
+    /// 查询指定文件下已成功上报给服务端的 `(rule_id, match_hash)` 集合。
+    pub fn reported_keys_for_path(&self, path: &Path) -> Result<HashSet<(String, String)>> {
+        let key = path_to_key(path);
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT rule_id, match_hash FROM reported_events WHERE path = ?1 AND status = 'sent'",
+        )?;
+        let rows = stmt.query_map(params![key], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    }
+
+    /// 持久化记录一条已成功上报给服务端的命中，防止客户端重启或重扫时重复上报。
+    pub fn mark_reported(
+        &self,
+        path: &Path,
+        rule_id: &str,
+        match_hash: &str,
+        target: &str,
+    ) -> Result<()> {
+        let key = path_to_key(path);
+        let dedupe_key = crate::util::sha256_hex_str(&format!("{key}|{rule_id}|{match_hash}"));
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO reported_events(dedupe_key, path, rule_id, match_hash, target, status, reported_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, 'sent', ?6)
+             ON CONFLICT(dedupe_key) DO UPDATE SET
+                target = excluded.target,
+                status = 'sent',
+                reported_at = excluded.reported_at",
+            params![dedupe_key, key, rule_id, match_hash, target, now_ts()],
+        )?;
+        Ok(())
+    }
 }
 
 /// Open a connection and apply pragmas.
@@ -680,5 +732,22 @@ mod tests {
         let store = Store::open(&db).unwrap();
         assert_eq!(store.stats().unwrap().findings, 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reported_events_persist_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("reported.db");
+        let path = Path::new("/tmp/secret.txt");
+        {
+            let store = Store::open(&db).unwrap();
+            store
+                .mark_reported(path, "cn_mobile", "h1", "127.0.0.1:5514")
+                .unwrap();
+        }
+        let reopened = Store::open(&db).unwrap();
+        let reported = reopened.reported_keys_for_path(path).unwrap();
+        assert!(reported.contains(&("cn_mobile".to_string(), "h1".to_string())));
+        assert!(!reported.contains(&("cn_mobile".to_string(), "h2".to_string())));
     }
 }

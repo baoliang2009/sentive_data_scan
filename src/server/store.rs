@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS events (
     category      TEXT NOT NULL DEFAULT '',
     severity      TEXT NOT NULL,
     masked        TEXT NOT NULL DEFAULT '',
+    matched       TEXT NOT NULL DEFAULT '',
+    file_name     TEXT NOT NULL DEFAULT '',
     path          TEXT NOT NULL DEFAULT '',
     line          INTEGER NOT NULL DEFAULT 0,
     column_no     INTEGER NOT NULL DEFAULT 0,
@@ -99,6 +101,8 @@ pub struct ServerEvent {
     pub category: String,
     pub severity: Severity,
     pub masked: String,
+    pub matched: String,
+    pub file_name: String,
     pub path: String,
     pub line: usize,
     pub column: usize,
@@ -149,6 +153,10 @@ pub struct IncomingFinding {
     pub severity: String,
     #[serde(default)]
     pub masked: String,
+    #[serde(default, alias = "value")]
+    pub matched: String,
+    #[serde(default)]
+    pub file_name: String,
     #[serde(default)]
     pub path: String,
     #[serde(default)]
@@ -240,6 +248,17 @@ impl ServerStore {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)
             .with_context(|| format!("初始化服务端数据库失败 {}", path.display()))?;
+        for sql in [
+            "ALTER TABLE events ADD COLUMN matched TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE events ADD COLUMN file_name TEXT NOT NULL DEFAULT ''",
+        ] {
+            if let Err(error) = conn.execute(sql, []) {
+                let message = error.to_string();
+                if !message.contains("duplicate column name") {
+                    return Err(error).with_context(|| format!("迁移服务端数据库失败 {}", path.display()));
+                }
+            }
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -306,8 +325,8 @@ impl ServerStore {
             let mut stmt = tx.prepare(
                 "INSERT OR IGNORE INTO events(
                     agent_id, hostname, username, rule_id, rule_name, category, severity,
-                    masked, path, line, column_no, snippet, match_hash, event_time, received_at
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    masked, matched, file_name, path, line, column_no, snippet, match_hash, event_time, received_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             )?;
             for finding in &batch.findings {
                 let severity = finding
@@ -315,11 +334,19 @@ impl ServerStore {
                     .trim()
                     .parse::<Severity>()
                     .unwrap_or(Severity::Medium);
+                let masked = finding.masked.trim();
+                let matched = if finding.matched.trim().is_empty() {
+                    masked
+                } else {
+                    finding.matched.trim()
+                };
+                let path = finding.path.trim();
+                let file_name = extract_file_name(&finding.file_name, path);
                 // match_hash 缺失时用内容摘要兜底，保证去重仍然有效。
                 let match_hash = if finding.match_hash.trim().is_empty() {
                     crate::util::sha256_hex_str(&format!(
                         "{}|{}|{}",
-                        finding.rule_id, finding.masked, finding.path
+                        finding.rule_id, masked, path
                     ))
                 } else {
                     finding.match_hash.trim().to_string()
@@ -332,8 +359,10 @@ impl ServerStore {
                     finding.rule_name.trim(),
                     finding.category.trim(),
                     severity.as_str(),
-                    finding.masked.trim(),
-                    finding.path.trim(),
+                    masked,
+                    matched,
+                    file_name,
+                    path,
                     finding.line.max(0),
                     finding.column.max(0),
                     finding.snippet.trim(),
@@ -478,11 +507,11 @@ impl ServerStore {
         }
         if !filter.q.trim().is_empty() {
             clauses.push(
-                "(masked LIKE ? OR path LIKE ? OR snippet LIKE ? OR rule_name LIKE ? OR hostname LIKE ? OR username LIKE ?)"
+                "(masked LIKE ? OR matched LIKE ? OR file_name LIKE ? OR path LIKE ? OR snippet LIKE ? OR rule_name LIKE ? OR hostname LIKE ? OR username LIKE ?)"
                     .to_string(),
             );
             let pattern = format!("%{}%", filter.q.trim());
-            for _ in 0..6 {
+            for _ in 0..8 {
                 args.push(Box::new(pattern.clone()));
             }
         }
@@ -513,7 +542,7 @@ impl ServerStore {
 
         let mut stmt = conn.prepare(&format!(
             "SELECT id, agent_id, hostname, username, rule_id, rule_name, category, severity,
-                    masked, path, line, column_no, snippet, event_time, received_at
+                    masked, matched, file_name, path, line, column_no, snippet, event_time, received_at
              FROM events{where_sql}
              ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?"
         ))?;
@@ -780,8 +809,24 @@ impl PurgeReport {
     }
 }
 
+fn extract_file_name(file_name: &str, path: &str) -> String {
+    let trimmed = file_name.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    path.trim()
+        .rsplit(['/', '\\'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
 fn map_event(row: &Row<'_>) -> rusqlite::Result<ServerEvent> {
     let severity: String = row.get(7)?;
+    let masked: String = row.get(8)?;
+    let matched: String = row.get(9)?;
+    let file_name: String = row.get(10)?;
+    let path: String = row.get(11)?;
     Ok(ServerEvent {
         id: row.get(0)?,
         agent_id: row.get(1)?,
@@ -791,12 +836,18 @@ fn map_event(row: &Row<'_>) -> rusqlite::Result<ServerEvent> {
         rule_name: row.get(5)?,
         category: row.get(6)?,
         severity: severity.parse().unwrap_or(Severity::Medium),
-        masked: row.get(8)?,
-        path: row.get(9)?,
-        line: row.get::<_, i64>(10)?.max(0) as usize,
-        column: row.get::<_, i64>(11)?.max(0) as usize,
-        snippet: row.get(12)?,
-        event_time: row.get(13)?,
-        received_at: row.get(14)?,
+        matched: if matched.is_empty() {
+            masked.clone()
+        } else {
+            matched
+        },
+        masked,
+        file_name: extract_file_name(&file_name, &path),
+        path,
+        line: row.get::<_, i64>(12)?.max(0) as usize,
+        column: row.get::<_, i64>(13)?.max(0) as usize,
+        snippet: row.get(14)?,
+        event_time: row.get(15)?,
+        received_at: row.get(16)?,
     })
 }

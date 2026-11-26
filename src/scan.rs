@@ -113,8 +113,11 @@ impl Scanner {
                 crate::identity::Identity::ephemeral(&config)
             }
         };
-        let forwarder =
-            match crate::syslog::Forwarder::spawn_with_identity(&config.syslog, identity.clone()) {
+        let forwarder = match crate::syslog::Forwarder::spawn_with_store(
+            &config.syslog,
+            identity.clone(),
+            Some(Arc::clone(&store)),
+        ) {
                 Some(forwarder) => {
                     tracing::info!(
                         min_severity = config.syslog.min_severity.as_str(),
@@ -399,9 +402,24 @@ impl Scanner {
                     "开始检测文件内容"
                 );
                 let findings = self.detector.detect(&content.text, path);
+                let db_findings: std::borrow::Cow<'_, [Finding]> =
+                    if !self.config.storage.store_raw_match && findings.iter().any(|f| f.raw.is_some()) {
+                        std::borrow::Cow::Owned(
+                            findings
+                                .iter()
+                                .map(|f| {
+                                    let mut cloned = f.clone();
+                                    cloned.raw = None;
+                                    cloned
+                                })
+                                .collect(),
+                        )
+                    } else {
+                        std::borrow::Cow::Borrowed(&findings)
+                    };
                 match self
                     .store
-                    .save_file(path, size, mtime, &content.content_hash, &findings)
+                    .save_file(path, size, mtime, &content.content_hash, &db_findings)
                 {
                     Ok(outcome) => {
                         stats.scanned.fetch_add(1, Ordering::Relaxed);
@@ -425,17 +443,27 @@ impl Scanner {
                             stats.severity[severity as usize].fetch_add(count, Ordering::Relaxed);
                         }
                         stats.add_examples(&findings, &outcome.new_hashes);
-                        // 只外发新增命中：全量对账时旧记录不会重复推送。
+                        // 仅外发尚未成功上报过的命中：既避免客户端重启/重扫时重复上报，
+                        // 也允许因网络失败未成功送达的记录在下次扫描时自动补报。
                         if let Some(forwarder) = &self.forwarder {
-                            if !outcome.new_hashes.is_empty() {
+                            if !findings.is_empty() {
+                                let reported = self
+                                    .store
+                                    .reported_keys_for_path(path)
+                                    .unwrap_or_default();
                                 let fresh: Vec<Finding> = findings
                                     .iter()
                                     .filter(|finding| {
-                                        outcome.new_hashes.contains(&finding.match_hash)
+                                        !reported.contains(&(
+                                            finding.rule_id.clone(),
+                                            finding.match_hash.clone(),
+                                        ))
                                     })
                                     .cloned()
                                     .collect();
-                                forwarder.submit(path, fresh);
+                                if !fresh.is_empty() {
+                                    forwarder.submit(path, fresh);
+                                }
                             }
                         }
                         let done = stats.scanned.load(Ordering::Relaxed);

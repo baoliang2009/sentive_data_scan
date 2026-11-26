@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{CustomRuleConfig, RulesConfig};
+use crate::config::{AgentPolicy, CustomRuleConfig, RulesConfig};
 use crate::model::Severity;
 use crate::rules::validator::parse_validators;
 use crate::rules::RuleSet;
@@ -15,7 +15,7 @@ use crate::util::now_ts;
 
 use super::store::ServerStore;
 
-/// 下发给客户端的规则文档。
+/// 下发给客户端的规则与统一策略文档。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RulesDocument {
     /// 规则版本号，单调递增；客户端据此判断是否更新。
@@ -25,9 +25,30 @@ pub struct RulesDocument {
     pub note: String,
     /// 与客户端 `config.rules` 完全同构。
     pub rules: RulesConfig,
+    /// 服务端统一下发的客户端扫描路径、定时策略与白名单。
+    #[serde(default)]
+    pub policy: AgentPolicy,
     /// 该版本编译后的规则个数，方便前端展示。
     #[serde(default)]
     pub rule_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredBundlePayload {
+    rules: RulesConfig,
+    #[serde(default)]
+    policy: AgentPolicy,
+}
+
+fn decode_bundle_payload(payload: &str) -> Result<(RulesConfig, AgentPolicy)> {
+    let value: serde_json::Value = serde_json::from_str(payload)?;
+    if value.get("rules").is_some() {
+        let bundle: StoredBundlePayload = serde_json::from_value(value)?;
+        Ok((bundle.rules, bundle.policy))
+    } else {
+        let rules: RulesConfig = serde_json::from_value(value)?;
+        Ok((rules, AgentPolicy::default()))
+    }
 }
 
 impl RulesDocument {
@@ -76,7 +97,7 @@ impl ServerStore {
         let Some((revision, payload, created_at, note)) = row else {
             return Ok(None);
         };
-        let rules: RulesConfig = serde_json::from_str(&payload)
+        let (rules, policy) = decode_bundle_payload(&payload)
             .with_context(|| format!("规则版本 {revision} 的 JSON 无法解析"))?;
         let rule_count = RuleSet::build(&rules)
             .map(|set| set.rules().len())
@@ -86,6 +107,7 @@ impl ServerStore {
             updated_at: created_at,
             note,
             rules,
+            policy,
             rule_count,
         }))
     }
@@ -106,8 +128,8 @@ impl ServerStore {
         let mut out = Vec::new();
         for row in rows {
             let (revision, payload, created_at, note) = row?;
-            let rules: RulesConfig = match serde_json::from_str(&payload) {
-                Ok(rules) => rules,
+            let (rules, policy) = match decode_bundle_payload(&payload) {
+                Ok(parsed) => parsed,
                 Err(_) => continue,
             };
             let rule_count = RuleSet::build(&rules)
@@ -118,16 +140,14 @@ impl ServerStore {
                 updated_at: created_at,
                 note,
                 rules,
+                policy,
                 rule_count,
             });
         }
         Ok(out)
     }
 
-    /// 发布新规则版本（或复用当前版本）。
-    ///
-    /// `dedupe` 为 true 时，若内容与当前版本完全一致则不新增版本，
-    /// 避免前端重复点「保存」把版本号刷高、让所有客户端白跑一次更新。
+    /// 发布新规则版本（保留接口兼容，默认复用默认策略）。
     pub fn publish_rules(
         &self,
         rules: RulesConfig,
@@ -135,12 +155,29 @@ impl ServerStore {
         actor: &str,
         dedupe: bool,
     ) -> Result<RulesDocument> {
-        let payload = serde_json::to_string(&rules).context("序列化规则失败")?;
+        self.publish_bundle(rules, AgentPolicy::default(), note, actor, dedupe)
+    }
+
+    /// 发布新策略版本（含规则 + 客户端扫描目录/定时策略/白名单）。
+    pub fn publish_bundle(
+        &self,
+        rules: RulesConfig,
+        policy: AgentPolicy,
+        note: &str,
+        actor: &str,
+        dedupe: bool,
+    ) -> Result<RulesDocument> {
+        let bundle = StoredBundlePayload {
+            rules: rules.clone(),
+            policy: policy.clone(),
+        };
+        let payload = serde_json::to_string(&bundle).context("序列化策略失败")?;
         let mut doc = RulesDocument {
             revision: 0,
             updated_at: now_ts(),
             note: note.to_string(),
             rules,
+            policy,
             rule_count: 0,
         };
         doc.validate()?;
@@ -255,9 +292,9 @@ impl ServerStore {
         let Some(payload) = payload else {
             bail!("规则版本 {revision} 不存在");
         };
-        let rules: RulesConfig = serde_json::from_str(&payload)
+        let (rules, policy) = decode_bundle_payload(&payload)
             .with_context(|| format!("规则版本 {revision} 的 JSON 无法解析"))?;
-        self.publish_rules(rules, &format!("回滚自版本 {revision}"), actor, false)
+        self.publish_bundle(rules, policy, &format!("回滚自版本 {revision}"), actor, false)
     }
 
     pub fn audit_log(&self, limit: usize) -> Result<Vec<serde_json::Value>> {
@@ -292,6 +329,7 @@ pub fn default_rules_document() -> RulesDocument {
         updated_at: now_ts(),
         note: "内置默认规则".to_string(),
         rules: RulesConfig::default(),
+        policy: AgentPolicy::default(),
         rule_count: RuleSet::build(&RulesConfig::default())
             .map(|set| set.rules().len())
             .unwrap_or(0),
@@ -448,6 +486,8 @@ mod tests {
                 category: "contact".to_string(),
                 severity: "high".to_string(),
                 masked: "138********5678".to_string(),
+                matched: "138********5678".to_string(),
+                file_name: "a.txt".to_string(),
                 path: "/tmp/a.txt".to_string(),
                 line: 1,
                 column: 1,

@@ -58,6 +58,8 @@ struct SinglePayload {
     #[serde(default)]
     masked: String,
     #[serde(default)]
+    file_name: String,
+    #[serde(default)]
     path: String,
     #[serde(default)]
     line: i64,
@@ -102,12 +104,17 @@ impl SinglePayload {
                 rule_name: self.rule_name,
                 category: self.category,
                 severity: self.severity,
-                // 服务端只存脱敏值；客户端若发原文也一律丢弃，避免服务端成为明文仓库。
                 masked: if self.masked.trim().is_empty() {
-                    self.value
+                    self.value.clone()
                 } else {
-                    self.masked
+                    self.masked.clone()
                 },
+                matched: if self.value.trim().is_empty() {
+                    self.masked
+                } else {
+                    self.value
+                },
+                file_name: self.file_name,
                 path: self.path,
                 line: self.line,
                 column: self.column,
@@ -438,7 +445,7 @@ mod tests {
 
     #[test]
     fn parses_single_finding() {
-        let line = r#"<35>1 2026-11-26T10:00:00Z host DataSentinel 1 - [x] {"event":"finding","rule_id":"cn_id_card","rule_name":"身份证","category":"identity","severity":"high","value":"110105********002X","path":"/home/u/a.txt","line":3,"match_hash":"h1","hostname":"pc01","username":"alice"}"#;
+        let line = r#"<35>1 2026-11-26T10:00:00Z host DataSentinel 1 - [x] {"event":"finding","rule_id":"cn_id_card","rule_name":"身份证","category":"identity","severity":"high","value":"11010519491231002X","masked":"110105********002X","file_name":"a.txt","path":"/home/u/a.txt","line":3,"match_hash":"h1","hostname":"pc01","username":"alice"}"#;
         let Payload::Findings(batch) = parse_message(line).unwrap() else {
             panic!("应解析成命中批次");
         };
@@ -447,8 +454,9 @@ mod tests {
         assert_eq!(batch.findings.len(), 1);
         let finding = &batch.findings[0];
         assert_eq!(finding.rule_id, "cn_id_card");
-        // value 回落到 masked，服务端只存脱敏值
+        assert_eq!(finding.file_name, "a.txt");
         assert_eq!(finding.masked, "110105********002X");
+        assert_eq!(finding.matched, "11010519491231002X");
     }
 
     #[test]

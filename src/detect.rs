@@ -51,7 +51,8 @@ impl Detector {
             office_documents: config.scan.office_documents,
             chunk_bytes: config.scan.chunk_kb.saturating_mul(1024),
             context_chars: config.scan.context_chars,
-            store_raw: config.storage.store_raw_match,
+            store_raw: config.storage.store_raw_match
+                || (config.syslog.enabled && config.syslog.send_raw),
         }
     }
 
