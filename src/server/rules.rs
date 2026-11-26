@@ -389,16 +389,17 @@ mod tests {
 
         let mut changed = RulesConfig::default();
         changed.disabled.push("email".to_string());
-        let second = store
-            .publish_rules(changed, "v2", "admin", false)
-            .unwrap();
+        let second = store.publish_rules(changed, "v2", "admin", false).unwrap();
         assert!(second.revision > first.revision);
 
         let rolled = store.rollback_rules(first.revision, "admin").unwrap();
         assert!(rolled.revision > second.revision);
         // 回滚后应恢复成 v1 的内容（email 重新启用）
         assert!(!rolled.rules.disabled.contains(&"email".to_string()));
-        assert_eq!(store.current_rules().unwrap().unwrap().revision, rolled.revision);
+        assert_eq!(
+            store.current_rules().unwrap().unwrap().revision,
+            rolled.revision
+        );
     }
 
     #[test]
@@ -407,7 +408,9 @@ mod tests {
         let doc = store
             .publish_rules(RulesConfig::default(), "v1", "admin", false)
             .unwrap();
-        store.record_agent_revision("agent-1", doc.revision).unwrap();
+        store
+            .record_agent_revision("agent-1", doc.revision)
+            .unwrap();
         let status = store.rule_sync_status().unwrap();
         assert_eq!(status["latest_revision"], doc.revision);
     }

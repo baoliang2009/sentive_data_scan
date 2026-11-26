@@ -114,9 +114,7 @@ pub struct RetentionConfig {
 
 impl Default for RetentionConfig {
     fn default() -> Self {
-        Self {
-            event_days: 180,
-        }
+        Self { event_days: 180 }
     }
 }
 
@@ -291,7 +289,9 @@ pub fn parse_cidr(value: &str) -> Result<()> {
         .parse()
         .with_context(|| format!("IP 地址无效: {addr}"))?;
     if let Some(prefix) = prefix {
-        let prefix: u8 = prefix.parse().with_context(|| format!("前缀长度无效: {prefix}"))?;
+        let prefix: u8 = prefix
+            .parse()
+            .with_context(|| format!("前缀长度无效: {prefix}"))?;
         let max = if ip.is_ipv4() { 32 } else { 128 };
         if prefix > max {
             bail!("前缀长度 {prefix} 超过 {max}");

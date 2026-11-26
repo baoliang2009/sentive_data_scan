@@ -17,19 +17,11 @@ use crate::server::http::Request;
 pub const JSON: &str = "application/json; charset=utf-8";
 
 pub fn ok(value: Value) -> (u16, &'static str, Vec<u8>) {
-    (
-        200,
-        JSON,
-        serde_json::to_vec(&value).unwrap_or_default(),
-    )
+    (200, JSON, serde_json::to_vec(&value).unwrap_or_default())
 }
 
 pub fn created(value: Value) -> (u16, &'static str, Vec<u8>) {
-    (
-        201,
-        JSON,
-        serde_json::to_vec(&value).unwrap_or_default(),
-    )
+    (201, JSON, serde_json::to_vec(&value).unwrap_or_default())
 }
 
 pub fn error_response(status: u16, message: impl Into<String>) -> (u16, &'static str, Vec<u8>) {
@@ -76,7 +68,10 @@ pub fn login(
     (ok(json!({ "ok": true })), Some(cookie))
 }
 
-pub fn logout(auth: &AuthState, request: &Request) -> ((u16, &'static str, Vec<u8>), Option<String>) {
+pub fn logout(
+    auth: &AuthState,
+    request: &Request,
+) -> ((u16, &'static str, Vec<u8>), Option<String>) {
     if let Some(token) = request.cookie("sentinel_session") {
         auth.sessions.revoke(&token);
     }
@@ -85,7 +80,10 @@ pub fn logout(auth: &AuthState, request: &Request) -> ((u16, &'static str, Vec<u
 }
 
 /// 校验控制台会话；成功返回操作者标识（用于审计）。
-pub fn authorize(auth: &AuthState, request: &Request) -> Result<String, (u16, &'static str, Vec<u8>)> {
+pub fn authorize(
+    auth: &AuthState,
+    request: &Request,
+) -> Result<String, (u16, &'static str, Vec<u8>)> {
     let Some(token) = request.cookie("sentinel_session") else {
         return Err(error_response(401, "未登录"));
     };
@@ -143,7 +141,10 @@ pub fn handle_agent(request: &Request, state: &AppState) -> (u16, &'static str, 
                 Ok(body) => body,
                 Err(error) => return error_response(400, error),
             };
-            let agent_id = body.get("agent_id").and_then(Value::as_str).unwrap_or_default();
+            let agent_id = body
+                .get("agent_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let revision = body.get("revision").and_then(Value::as_i64).unwrap_or(0);
             if agent_id.trim().is_empty() {
                 return error_response(400, "缺少 agent_id");
@@ -159,11 +160,7 @@ pub fn handle_agent(request: &Request, state: &AppState) -> (u16, &'static str, 
 
 // ---------------------------------------------------------- 控制台 API --
 
-pub fn handle(
-    request: &Request,
-    state: &AppState,
-    actor: &str,
-) -> (u16, &'static str, Vec<u8>) {
+pub fn handle(request: &Request, state: &AppState, actor: &str) -> (u16, &'static str, Vec<u8>) {
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/api/me") => ok(json!({ "actor": actor, "version": env!("CARGO_PKG_VERSION") })),
 
@@ -242,10 +239,11 @@ pub fn handle(
             let Some(rules_value) = body.get("rules") else {
                 return error_response(400, "缺少 rules");
             };
-            let rules: crate::config::RulesConfig = match serde_json::from_value(rules_value.clone()) {
-                Ok(rules) => rules,
-                Err(error) => return error_response(400, format!("rules 结构不合法：{error}")),
-            };
+            let rules: crate::config::RulesConfig =
+                match serde_json::from_value(rules_value.clone()) {
+                    Ok(rules) => rules,
+                    Err(error) => return error_response(400, format!("rules 结构不合法：{error}")),
+                };
             let note = body.get("note").and_then(Value::as_str).unwrap_or("");
             match state.store.publish_rules(rules, note, actor, true) {
                 Ok(doc) => created(json!({
@@ -304,9 +302,11 @@ pub fn handle(
             let cutoff = crate::util::now_ts() - days.saturating_mul(86_400);
             match state.store.purge_events_before(cutoff) {
                 Ok(removed) => {
-                    let _ = state
-                        .store
-                        .record_audit(actor, "purge_events", &format!("days={days} removed={removed}"));
+                    let _ = state.store.record_audit(
+                        actor,
+                        "purge_events",
+                        &format!("days={days} removed={removed}"),
+                    );
                     ok(json!({ "ok": true, "removed": removed }))
                 }
                 Err(error) => fail(error),

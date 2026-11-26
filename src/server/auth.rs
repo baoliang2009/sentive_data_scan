@@ -31,7 +31,8 @@ pub fn verify_password(password: &str, stored: &str) -> bool {
     if parts.next() != Some("pbkdf2") {
         return false;
     }
-    let (Some(iterations), Some(salt_hex), Some(key_hex)) = (parts.next(), parts.next(), parts.next())
+    let (Some(iterations), Some(salt_hex), Some(key_hex)) =
+        (parts.next(), parts.next(), parts.next())
     else {
         return false;
     };
@@ -165,7 +166,10 @@ pub fn constant_time_eq(left: &str, right: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 /// 生成一个可读的随机口令（首启打印给管理员）。

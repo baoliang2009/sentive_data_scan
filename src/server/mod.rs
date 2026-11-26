@@ -81,11 +81,7 @@ pub fn run(config_path: Option<PathBuf>) -> Result<()> {
         ensure_credentials(&mut config, &path)?;
 
     let store = Arc::new(ServerStore::open(&config.database_path())?);
-    let auth = Arc::new(AuthState::new(
-        &config,
-        password_hash,
-        agent_token.clone(),
-    ));
+    let auth = Arc::new(AuthState::new(&config, password_hash, agent_token.clone()));
 
     println!("数据哨兵服务端已启动");
     println!("  配置文件：{}", path.display());
@@ -170,10 +166,7 @@ fn ensure_credentials(
         dirty = true;
         (hash, Some(password))
     } else {
-        (
-            config.auth.admin_password_hash.trim().to_string(),
-            None,
-        )
+        (config.auth.admin_password_hash.trim().to_string(), None)
     };
 
     // Agent Token：已配置则沿用；否则生成。
@@ -187,7 +180,11 @@ fn ensure_credentials(
     };
 
     if dirty {
-        write_back_credentials(path, &config.auth.admin_password_hash, &config.auth.agent_token)?;
+        write_back_credentials(
+            path,
+            &config.auth.admin_password_hash,
+            &config.auth.agent_token,
+        )?;
     }
     Ok((password_hash, plain, agent_token, token_generated))
 }
@@ -197,8 +194,7 @@ fn write_back_credentials(path: &std::path::Path, hash: &str, token: &str) -> Re
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let mut updated = crate::webui::tomlpatch_set_key(&text, "auth", "admin_password_hash", hash);
     updated = crate::webui::tomlpatch_set_key(&updated, "auth", "agent_token", token);
-    std::fs::write(path, updated)
-        .with_context(|| format!("无法回写凭据到 {}", path.display()))?;
+    std::fs::write(path, updated).with_context(|| format!("无法回写凭据到 {}", path.display()))?;
     let _ = crate::config::secure_file(path);
     Ok(())
 }

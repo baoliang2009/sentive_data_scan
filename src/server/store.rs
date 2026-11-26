@@ -411,11 +411,7 @@ impl ServerStore {
                 .filter(|item| !item.is_empty())
                 .collect();
             if !values.is_empty() {
-                let placeholders = values
-                    .iter()
-                    .map(|_| "?")
-                    .collect::<Vec<_>>()
-                    .join(",");
+                let placeholders = values.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                 clauses.push(format!("severity IN ({placeholders})"));
                 for value in values {
                     args.push(Box::new(value));
@@ -505,8 +501,9 @@ impl ServerStore {
 
         let mut by_category = serde_json::Map::new();
         {
-            let mut stmt =
-                conn.prepare("SELECT category, COUNT(*) FROM events GROUP BY category ORDER BY 2 DESC")?;
+            let mut stmt = conn.prepare(
+                "SELECT category, COUNT(*) FROM events GROUP BY category ORDER BY 2 DESC",
+            )?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })?;
@@ -638,7 +635,8 @@ impl ServerStore {
             "SELECT DISTINCT CASE WHEN username = '' THEN hostname ELSE username END FROM events ORDER BY 1",
         )?;
         let hosts = collect("SELECT DISTINCT hostname FROM events ORDER BY 1")?;
-        let categories = collect("SELECT DISTINCT category FROM events WHERE category <> '' ORDER BY 1")?;
+        let categories =
+            collect("SELECT DISTINCT category FROM events WHERE category <> '' ORDER BY 1")?;
         let severities = collect("SELECT DISTINCT severity FROM events ORDER BY 1")?;
         Ok(serde_json::json!({
             "users": users,

@@ -48,7 +48,9 @@ impl Request {
     /// 从 `Authorization: Bearer xxx` 或 `X-Sentinel-Token` 取令牌。
     pub fn bearer(&self) -> Option<&str> {
         if let Some(value) = self.header("authorization") {
-            if let Some(token) = value.strip_prefix("Bearer ").or_else(|| value.strip_prefix("bearer "))
+            if let Some(token) = value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
             {
                 return Some(token.trim());
             }
@@ -97,11 +99,9 @@ pub fn handle_connection(mut stream: TcpStream, state: Arc<AppState>) {
 fn route(request: &Request, state: &AppState) -> (u16, &'static str, Vec<u8>, Vec<String>) {
     let mut cookies = Vec::new();
     let (status, ctype, body) = match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/") | ("GET", "/index.html") => (
-            200,
-            "text/html; charset=utf-8",
-            index_html().into_bytes(),
-        ),
+        ("GET", "/") | ("GET", "/index.html") => {
+            (200, "text/html; charset=utf-8", index_html().into_bytes())
+        }
         ("GET", "/static/app.css") => (
             200,
             "text/css; charset=utf-8",

@@ -185,8 +185,8 @@ fn run_udp(
     store: &Arc<ServerStore>,
     stats: &Arc<IngestStats>,
 ) -> Result<()> {
-    let socket =
-        UdpSocket::bind(bind).with_context(|| format!("无法监听 UDP {bind}（514 端口需要 root）"))?;
+    let socket = UdpSocket::bind(bind)
+        .with_context(|| format!("无法监听 UDP {bind}（514 端口需要 root）"))?;
     tracing::info!(bind, "syslog UDP 接收器已启动");
     let mut buffer = vec![0u8; max_bytes];
     loop {
@@ -215,8 +215,8 @@ fn run_tcp(
     store: &Arc<ServerStore>,
     stats: &Arc<IngestStats>,
 ) -> Result<()> {
-    let listener =
-        TcpListener::bind(bind).with_context(|| format!("无法监听 TCP {bind}（514 端口需要 root）"))?;
+    let listener = TcpListener::bind(bind)
+        .with_context(|| format!("无法监听 TCP {bind}（514 端口需要 root）"))?;
     tracing::info!(bind, "syslog TCP 接收器已启动");
     for incoming in listener.incoming() {
         let stream = match incoming {
@@ -260,7 +260,12 @@ fn run_tcp(
     Ok(())
 }
 
-fn handle_line(message: &str, peer: SocketAddr, store: &Arc<ServerStore>, stats: &Arc<IngestStats>) {
+fn handle_line(
+    message: &str,
+    peer: SocketAddr,
+    store: &Arc<ServerStore>,
+    stats: &Arc<IngestStats>,
+) {
     match parse_message(message) {
         Ok(Some(batch)) => {
             if batch.findings.is_empty() {
@@ -360,7 +365,8 @@ mod tests {
 
     #[test]
     fn parses_batch_payload() {
-        let line = r#"{"agent_id":"a1","hostname":"pc01","findings":[{"rule_id":"x","severity":"low"}]}"#;
+        let line =
+            r#"{"agent_id":"a1","hostname":"pc01","findings":[{"rule_id":"x","severity":"low"}]}"#;
         let batch = parse_message(line).unwrap().unwrap();
         assert_eq!(batch.agent_id, "a1");
         assert_eq!(batch.findings.len(), 1);
