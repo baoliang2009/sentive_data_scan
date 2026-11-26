@@ -326,7 +326,11 @@ impl Store {
             return false;
         };
         let in_files: bool = conn
-            .query_row("SELECT 1 FROM files WHERE path = ?1 LIMIT 1", params![key], |_| Ok(true))
+            .query_row(
+                "SELECT 1 FROM files WHERE path = ?1 LIMIT 1",
+                params![key],
+                |_| Ok(true),
+            )
             .optional()
             .unwrap_or(None)
             .unwrap_or(false);

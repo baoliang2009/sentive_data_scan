@@ -164,17 +164,29 @@ fn serve<S: Read + Write>(stream: &mut S, state: &AppState, remote: String) {
         }
     };
 
-    let (status, ctype, body, cookies, headers) = route(&request, state);
-    respond(stream, status, ctype, &body, &cookies, &headers);
+    let res = route(&request, state);
+    respond(
+        stream,
+        res.status,
+        res.content_type,
+        &res.body,
+        &res.cookies,
+        &res.headers,
+    );
 }
 
-fn route(
-    request: &Request,
-    state: &AppState,
-) -> (u16, &'static str, Vec<u8>, Vec<String>, Vec<(String, String)>) {
+struct RouteOutcome {
+    status: u16,
+    content_type: &'static str,
+    body: Vec<u8>,
+    cookies: Vec<String>,
+    headers: Vec<(String, String)>,
+}
+
+fn route(request: &Request, state: &AppState) -> RouteOutcome {
     let mut cookies = Vec::new();
     let mut extra_headers = Vec::new();
-    let (status, ctype, body) = match (request.method.as_str(), request.path.as_str()) {
+    let (status, content_type, body) = match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") | ("GET", "/index.html") => {
             (200, "text/html; charset=utf-8", index_html().into_bytes())
         }
@@ -233,7 +245,13 @@ fn route(
         ("GET", _) => (404, "text/plain; charset=utf-8", b"Not Found".to_vec()),
         _ => api::error_response(405, "不支持的方法"),
     };
-    (status, ctype, body, cookies, extra_headers)
+    RouteOutcome {
+        status,
+        content_type,
+        body,
+        cookies,
+        headers: extra_headers,
+    }
 }
 
 fn index_html() -> String {

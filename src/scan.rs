@@ -118,18 +118,18 @@ impl Scanner {
             identity.clone(),
             Some(Arc::clone(&store)),
         ) {
-                Some(forwarder) => {
-                    tracing::info!(
-                        min_severity = config.syslog.min_severity.as_str(),
-                        discovery = %config.syslog.discovery,
-                        agent_id = %identity.agent_id,
-                        username = %identity.username,
-                        "syslog 外发已启用"
-                    );
-                    Some(forwarder)
-                }
-                None => None,
-            };
+            Some(forwarder) => {
+                tracing::info!(
+                    min_severity = config.syslog.min_severity.as_str(),
+                    discovery = %config.syslog.discovery,
+                    agent_id = %identity.agent_id,
+                    username = %identity.username,
+                    "syslog 外发已启用"
+                );
+                Some(forwarder)
+            }
+            None => None,
+        };
         Ok(Self {
             config,
             store,
@@ -403,7 +403,9 @@ impl Scanner {
                 );
                 let findings = self.detector.detect(&content.text, path);
                 let db_findings: std::borrow::Cow<'_, [Finding]> =
-                    if !self.config.storage.store_raw_match && findings.iter().any(|f| f.raw.is_some()) {
+                    if !self.config.storage.store_raw_match
+                        && findings.iter().any(|f| f.raw.is_some())
+                    {
                         std::borrow::Cow::Owned(
                             findings
                                 .iter()
@@ -447,10 +449,8 @@ impl Scanner {
                         // 也允许因网络失败未成功送达的记录在下次扫描时自动补报。
                         if let Some(forwarder) = &self.forwarder {
                             if !findings.is_empty() {
-                                let reported = self
-                                    .store
-                                    .reported_keys_for_path(path)
-                                    .unwrap_or_default();
+                                let reported =
+                                    self.store.reported_keys_for_path(path).unwrap_or_default();
                                 let fresh: Vec<Finding> = findings
                                     .iter()
                                     .filter(|finding| {

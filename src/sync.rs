@@ -80,7 +80,9 @@ pub fn resolve_server_url(config: &Config) -> Option<String> {
     }
     if config.syslog.uses_mdns() {
         let timeout = Duration::from_millis(config.syslog.mdns_timeout_ms.clamp(500, 30_000));
-        if let Some(found) = crate::mdns::global_resolver(&config.syslog.mdns_service, timeout).resolve() {
+        if let Some(found) =
+            crate::mdns::global_resolver(&config.syslog.mdns_service, timeout).resolve()
+        {
             if let Some(console) = found.console {
                 return Some(console.trim_end_matches('/').to_string());
             }
@@ -390,11 +392,12 @@ fn http_request_parts(
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
 
-    let host_header = if (parsed.https && parsed.port == 443) || (!parsed.https && parsed.port == 80) {
-        parsed.host.to_string()
-    } else {
-        format!("{}:{}", parsed.host, parsed.port)
-    };
+    let host_header =
+        if (parsed.https && parsed.port == 443) || (!parsed.https && parsed.port == 80) {
+            parsed.host.to_string()
+        } else {
+            format!("{}:{}", parsed.host, parsed.port)
+        };
 
     let mut req = format!(
         "{method} {full_path} HTTP/1.1\r\nHost: {host_header}\r\nAccept: application/json\r\nConnection: close\r\n"

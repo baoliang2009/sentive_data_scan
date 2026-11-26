@@ -16,7 +16,11 @@ pub fn render_csv(events: &[ServerEvent]) -> Vec<u8> {
         } else {
             ev.username.as_str()
         };
-        let status = if ev.file_deleted { "已删除" } else { "存在" };
+        let status = if ev.file_deleted {
+            "已删除"
+        } else {
+            "存在"
+        };
         let cols = [
             format_ts(ev.received_at),
             user.to_string(),
@@ -95,7 +99,12 @@ pub fn render_html(events: &[ServerEvent], total: u64) -> Vec<u8> {
 
     let mut cat_summary = String::new();
     for (cat, count) in by_cat {
-        let _ = write!(cat_summary, "<span class=\"pill\">{}：{}</span> ", html_escape(cat), count);
+        let _ = write!(
+            cat_summary,
+            "<span class=\"pill\">{}：{}</span> ",
+            html_escape(cat),
+            count
+        );
     }
 
     let html = format!(

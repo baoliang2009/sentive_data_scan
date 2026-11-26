@@ -117,7 +117,8 @@ impl Detector {
         let bytes =
             fs::read(path).with_context(|| format!("无法读取 PDF 文件 {}", path.display()))?;
         let content_hash = sha256_hex(&bytes);
-        let mut text = match std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&bytes)) {
+        let mut text = match std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&bytes))
+        {
             Ok(Ok(text)) => text,
             Ok(Err(error)) => {
                 tracing::debug!(path = %path.display(), error = %error, "PDF 文本抽取失败");

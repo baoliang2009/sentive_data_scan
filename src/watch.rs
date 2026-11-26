@@ -235,7 +235,10 @@ fn run_loop(
         // 守护进程通常长期不重启，日志需要主动清理。这里不绑定“定时对账”
         // （`full_scan_interval_hours = 0` 时那条分支永不执行），而是每天清一次。
         if last_log_prune.elapsed() >= Duration::from_secs(86_400) {
-            crate::config::prune_old_logs(&active_config.logs_dir(), crate::config::LOG_RETENTION_DAYS);
+            crate::config::prune_old_logs(
+                &active_config.logs_dir(),
+                crate::config::LOG_RETENTION_DAYS,
+            );
             last_log_prune = Instant::now();
         }
 
@@ -253,9 +256,9 @@ fn run_loop(
                 Ok(Some(bundle)) if current_bundle.as_ref() != Some(&bundle) => {
                     tracing::info!(revision = bundle.revision, "收到服务端新策略，正在热更新");
                     let merged = Arc::new(crate::sync::apply_bundle(&base_config, &bundle));
-                    match crate::rules::RuleSet::build(&merged.rules)
-                        .and_then(|rules| Scanner::new(Arc::clone(&merged), Arc::clone(&store), rules))
-                    {
+                    match crate::rules::RuleSet::build(&merged.rules).and_then(|rules| {
+                        Scanner::new(Arc::clone(&merged), Arc::clone(&store), rules)
+                    }) {
                         Ok(next_scanner) => {
                             scanner = Arc::new(next_scanner);
                             active_config = merged;

@@ -294,7 +294,13 @@ impl ServerStore {
         };
         let (rules, policy) = decode_bundle_payload(&payload)
             .with_context(|| format!("规则版本 {revision} 的 JSON 无法解析"))?;
-        self.publish_bundle(rules, policy, &format!("回滚自版本 {revision}"), actor, false)
+        self.publish_bundle(
+            rules,
+            policy,
+            &format!("回滚自版本 {revision}"),
+            actor,
+            false,
+        )
     }
 
     pub fn audit_log(&self, limit: usize) -> Result<Vec<serde_json::Value>> {
@@ -556,7 +562,10 @@ mod tests {
         store
             .ack_command("agent-del", cmd.id, "done", "已删除文件")
             .unwrap();
-        assert!(store.pending_commands_for_agent("agent-del").unwrap().is_empty());
+        assert!(store
+            .pending_commands_for_agent("agent-del")
+            .unwrap()
+            .is_empty());
         let (events_after, _) = store.events(&EventFilter::default()).unwrap();
         assert!(events_after[0].file_deleted);
     }

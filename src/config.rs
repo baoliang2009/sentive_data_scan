@@ -914,7 +914,13 @@ mod tests {
         assert_eq!(merged.effective_roots().len(), 1);
         assert_eq!(merged.scan.full_scan_interval_hours, 12);
         assert!(!merged.scan.scan_on_startup);
-        assert!(merged.scan.allow_globs.contains(&"**/ignore/**".to_string()));
-        assert!(merged.rules.allow_values.contains(&"13800138000".to_string()));
+        assert!(merged
+            .scan
+            .allow_globs
+            .contains(&"**/ignore/**".to_string()));
+        assert!(merged
+            .rules
+            .allow_values
+            .contains(&"13800138000".to_string()));
     }
 }

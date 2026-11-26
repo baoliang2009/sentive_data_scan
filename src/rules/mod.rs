@@ -524,8 +524,10 @@ mod tests {
 
     #[test]
     fn allow_values_filters_exact_and_masked() {
-        let mut config = RulesConfig::default();
-        config.allow_values = vec!["13812345678".to_string()];
+        let config = RulesConfig {
+            allow_values: vec!["13812345678".to_string()],
+            ..RulesConfig::default()
+        };
         let rules = RuleSet::build(&config).unwrap();
         let findings = rules.scan(
             "手机 13812345678 另一条 13912345678",

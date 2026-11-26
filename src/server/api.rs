@@ -189,7 +189,10 @@ pub fn handle_agent(request: &Request, state: &AppState) -> (u16, &'static str, 
             };
             let agent_id = body.get("agent_id").and_then(Value::as_str).unwrap_or("");
             let command_id = body.get("command_id").and_then(Value::as_i64).unwrap_or(0);
-            let status = body.get("status").and_then(Value::as_str).unwrap_or("failed");
+            let status = body
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("failed");
             let message = body.get("message").and_then(Value::as_str).unwrap_or("");
             if agent_id.trim().is_empty() || command_id <= 0 {
                 return error_response(400, "缺少 agent_id 或 command_id");
@@ -338,7 +341,11 @@ pub fn handle(request: &Request, state: &AppState, actor: &str) -> (u16, &'stati
                 Err(error) => return error_response(400, error),
             };
             let kind = body.get("kind").and_then(Value::as_str).unwrap_or("");
-            let entry = body.get("value").and_then(Value::as_str).unwrap_or("").trim();
+            let entry = body
+                .get("value")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
             if entry.is_empty() {
                 return error_response(400, "白名单内容不能为空");
             }
@@ -433,7 +440,10 @@ pub fn handle(request: &Request, state: &AppState, actor: &str) -> (u16, &'stati
                 Ok(()) => ok(json!({ "ok": true })),
                 Err(error) => error_response(502, format!("Webhook 推送失败：{error:#}")),
             },
-            None => error_response(400, "Webhook 未启用或 url 为空，请在 server.toml [webhook] 中配置"),
+            None => error_response(
+                400,
+                "Webhook 未启用或 url 为空，请在 server.toml [webhook] 中配置",
+            ),
         },
 
         ("POST", "/api/purge") => {

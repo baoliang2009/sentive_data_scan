@@ -286,7 +286,8 @@ impl ServerStore {
             if let Err(error) = conn.execute(sql, []) {
                 let message = error.to_string();
                 if !message.contains("duplicate column name") {
-                    return Err(error).with_context(|| format!("迁移服务端数据库失败 {}", path.display()));
+                    return Err(error)
+                        .with_context(|| format!("迁移服务端数据库失败 {}", path.display()));
                 }
             }
         }
@@ -375,10 +376,7 @@ impl ServerStore {
                 let file_name = extract_file_name(&finding.file_name, path);
                 // match_hash 缺失时用内容摘要兜底，保证去重仍然有效。
                 let match_hash = if finding.match_hash.trim().is_empty() {
-                    crate::util::sha256_hex_str(&format!(
-                        "{}|{}|{}",
-                        finding.rule_id, masked, path
-                    ))
+                    crate::util::sha256_hex_str(&format!("{}|{}|{}", finding.rule_id, masked, path))
                 } else {
                     finding.match_hash.trim().to_string()
                 };

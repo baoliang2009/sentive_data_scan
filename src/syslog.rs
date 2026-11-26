@@ -32,6 +32,8 @@ const MAX_MESSAGE_BYTES: usize = 8 * 1024;
 /// RFC 5424 里 DataSentinel 使用的私有 enterprise ID（示例区间）。
 const SD_ID: &str = "datasentinel@32473";
 
+pub type TrackedAck = Option<(String, Vec<(String, String)>)>;
+
 pub struct SyslogSender {
     config: SyslogConfig,
     hostname: String,
@@ -212,7 +214,7 @@ impl SyslogSender {
         &self,
         path: &Path,
         findings: &[Finding],
-    ) -> (usize, usize, Option<(String, Vec<(String, String)>)>) {
+    ) -> (usize, usize, TrackedAck) {
         let Some(target) = self.resolve_target() else {
             return (0, findings.len(), None);
         };
