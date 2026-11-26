@@ -173,6 +173,9 @@ fn run_loop(
         tracing::info!("当前未配置扫描目录，等待服务端下发策略");
     }
 
+    // 启动时即检查是否有待执行的远程指令（如删除敏感文件）
+    crate::sync::process_remote_commands(&base_config, &active_config, &store);
+
     // 启动即报到：否则一台没有新命中的机器要等到下次落盘命中才会
     // 出现在服务端「终端」页。
     scanner.heartbeat();
@@ -242,9 +245,10 @@ fn run_loop(
             last_heartbeat = Instant::now();
         }
 
-        // 定期向服务端拉取统一策略（扫描路径、定时周期、白名单与规则），变化时热更新。
+        // 定期向服务端拉取统一策略（扫描路径、定时周期、白名单与规则），变化时热更新，并处理远程指令。
         if last_sync.elapsed() >= sync_interval {
             last_sync = Instant::now();
+            crate::sync::process_remote_commands(&base_config, &active_config, &store);
             match crate::sync::fetch_policy(&base_config) {
                 Ok(Some(bundle)) if current_bundle.as_ref() != Some(&bundle) => {
                     tracing::info!(revision = bundle.revision, "收到服务端新策略，正在热更新");

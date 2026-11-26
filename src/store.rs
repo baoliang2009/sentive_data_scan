@@ -320,6 +320,29 @@ impl Store {
         Ok(())
     }
 
+    pub fn has_file_or_finding(&self, path: &Path) -> bool {
+        let key = path_to_key(path);
+        let Ok(conn) = self.conn() else {
+            return false;
+        };
+        let in_files: bool = conn
+            .query_row("SELECT 1 FROM files WHERE path = ?1 LIMIT 1", params![key], |_| Ok(true))
+            .optional()
+            .unwrap_or(None)
+            .unwrap_or(false);
+        if in_files {
+            return true;
+        }
+        conn.query_row(
+            "SELECT 1 FROM findings WHERE path = ?1 LIMIT 1",
+            params![key],
+            |_| Ok(true),
+        )
+        .optional()
+        .unwrap_or(None)
+        .unwrap_or(false)
+    }
+
     pub fn recent_findings(
         &self,
         min_severity: Option<Severity>,

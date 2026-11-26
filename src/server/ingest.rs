@@ -17,6 +17,7 @@ use serde::Deserialize;
 
 use super::config::ServerConfig;
 use super::store::{IncomingBatch, IncomingFinding, ServerStore};
+use super::webhook::WebhookDispatcher;
 
 /// 接收统计，供控制台展示。
 #[derive(Debug, Default)]
@@ -197,6 +198,15 @@ pub fn parse_message(message: &str) -> Result<Payload> {
 
 /// 启动接收器（非阻塞：在后台线程里跑，返回统计句柄）。
 pub fn spawn(config: &ServerConfig, store: Arc<ServerStore>) -> Result<Arc<IngestStats>> {
+    spawn_with_webhook(config, store, None)
+}
+
+/// 启动接收器并附带 Webhook 主动告警推送。
+pub fn spawn_with_webhook(
+    config: &ServerConfig,
+    store: Arc<ServerStore>,
+    webhook: Option<Arc<WebhookDispatcher>>,
+) -> Result<Arc<IngestStats>> {
     let stats = Arc::new(IngestStats::default());
     let protocols = config.listen_protocols();
     let bind = config.ingest.bind.clone();
@@ -208,13 +218,14 @@ pub fn spawn(config: &ServerConfig, store: Arc<ServerStore>) -> Result<Arc<Inges
         let stats = Arc::clone(&stats);
         let bind = bind.clone();
         let allow = Arc::clone(&allow);
+        let webhook = webhook.clone();
         let name = format!("sentinel-ingest-{protocol}");
         std::thread::Builder::new()
             .name(name)
             .spawn(move || {
                 let result = match protocol {
-                    "udp" => run_udp(&bind, max_bytes, &allow, &store, &stats),
-                    _ => run_tcp(&bind, max_bytes, &allow, &store, &stats),
+                    "udp" => run_udp(&bind, max_bytes, &allow, &store, &stats, &webhook),
+                    _ => run_tcp(&bind, max_bytes, &allow, &store, &stats, &webhook),
                 };
                 if let Err(error) = result {
                     tracing::error!(protocol, error = %format!("{error:#}"), "syslog 接收器退出");
@@ -235,6 +246,7 @@ fn run_udp(
     allow: &[String],
     store: &Arc<ServerStore>,
     stats: &Arc<IngestStats>,
+    webhook: &Option<Arc<WebhookDispatcher>>,
 ) -> Result<()> {
     let socket = UdpSocket::bind(bind)
         .with_context(|| format!("无法监听 UDP {bind}（514 端口需要 root）"))?;
@@ -250,7 +262,7 @@ fn run_udp(
                     continue;
                 }
                 let message = String::from_utf8_lossy(&buffer[..len]);
-                handle_line(&message, peer, store, stats);
+                handle_line(&message, peer, store, stats, webhook);
             }
             Err(error) => {
                 tracing::debug!(error = %error, "UDP 接收失败");
@@ -267,6 +279,7 @@ fn run_tcp(
     allow: &[String],
     store: &Arc<ServerStore>,
     stats: &Arc<IngestStats>,
+    webhook: &Option<Arc<WebhookDispatcher>>,
 ) -> Result<()> {
     let listener = TcpListener::bind(bind)
         .with_context(|| format!("无法监听 TCP {bind}（514 端口需要 root）"))?;
@@ -300,6 +313,7 @@ fn run_tcp(
         };
         let store = Arc::clone(store);
         let stats = Arc::clone(stats);
+        let webhook = webhook.clone();
         let spawned = std::thread::Builder::new()
             .name("sentinel-ingest-conn".into())
             .spawn(move || {
@@ -315,7 +329,13 @@ fn run_tcp(
                         Ok(_) => {
                             stats.packets.fetch_add(1, Ordering::Relaxed);
                             let line = String::from_utf8_lossy(&line_bytes);
-                            handle_line(line.trim_end_matches(['\r', '\n']), peer, &store, &stats);
+                            handle_line(
+                                line.trim_end_matches(['\r', '\n']),
+                                peer,
+                                &store,
+                                &stats,
+                                &webhook,
+                            );
                         }
                         Err(error) => {
                             tracing::debug!(error = %error, "TCP 读取失败，关闭连接");
@@ -337,6 +357,7 @@ fn handle_line(
     peer: SocketAddr,
     store: &Arc<ServerStore>,
     stats: &Arc<IngestStats>,
+    webhook: &Option<Arc<WebhookDispatcher>>,
 ) {
     match parse_message(message) {
         Ok(Payload::Findings(batch)) => {
@@ -348,6 +369,11 @@ fn handle_line(
                 Ok(inserted) => {
                     stats.accepted.fetch_add(1, Ordering::Relaxed);
                     stats.events.fetch_add(inserted as u64, Ordering::Relaxed);
+                    if inserted > 0 {
+                        if let Some(dispatcher) = webhook {
+                            dispatcher.notify_batch(&batch);
+                        }
+                    }
                 }
                 Err(error) => {
                     stats.rejected.fetch_add(1, Ordering::Relaxed);

@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS events (
     match_hash    TEXT NOT NULL DEFAULT '',
     event_time    TEXT NOT NULL DEFAULT '',   -- 客户端本地时间（RFC 3339）
     received_at   INTEGER NOT NULL,
+    file_deleted  INTEGER NOT NULL DEFAULT 0,
     UNIQUE(agent_id, rule_id, match_hash, received_at)
 );
 
@@ -87,6 +88,21 @@ CREATE TABLE IF NOT EXISTS audit_log (
     action     TEXT NOT NULL,
     detail     TEXT NOT NULL DEFAULT ''
 );
+
+-- 下发给客户端的远端指令队列（如删除敏感文件）。
+CREATE TABLE IF NOT EXISTS agent_commands (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id    TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    target_path TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    message     TEXT NOT NULL DEFAULT '',
+    created_by  TEXT NOT NULL DEFAULT '',
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_commands_agent_status ON agent_commands(agent_id, status);
 "#;
 
 /// 服务端保存的一条告警。
@@ -109,6 +125,20 @@ pub struct ServerEvent {
     pub snippet: String,
     pub event_time: String,
     pub received_at: i64,
+    pub file_deleted: bool,
+}
+
+/// 服务端下发给客户端的指令。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentCommand {
+    pub id: i64,
+    pub agent_id: String,
+    pub action: String,
+    pub target_path: String,
+    pub status: String,
+    pub message: String,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 impl ServerEvent {
@@ -251,6 +281,7 @@ impl ServerStore {
         for sql in [
             "ALTER TABLE events ADD COLUMN matched TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE events ADD COLUMN file_name TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE events ADD COLUMN file_deleted INTEGER NOT NULL DEFAULT 0",
         ] {
             if let Err(error) = conn.execute(sql, []) {
                 let message = error.to_string();
@@ -542,7 +573,7 @@ impl ServerStore {
 
         let mut stmt = conn.prepare(&format!(
             "SELECT id, agent_id, hostname, username, rule_id, rule_name, category, severity,
-                    masked, matched, file_name, path, line, column_no, snippet, event_time, received_at
+                    masked, matched, file_name, path, line, column_no, snippet, event_time, received_at, file_deleted
              FROM events{where_sql}
              ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?"
         ))?;
@@ -783,6 +814,10 @@ impl ServerStore {
                 [],
             )?;
         }
+        let _ = tx.execute(
+            "DELETE FROM agent_commands WHERE status != 'pending' AND updated_at < ?1",
+            params![cutoff_ts],
+        );
         tx.commit()?;
 
         Ok(PurgeReport {
@@ -791,6 +826,136 @@ impl ServerStore {
             rule_sets,
             agents,
         })
+    }
+
+    /// 管理员发起「删除敏感文件」指令：根据告警记录下发到对应客户端。
+    pub fn enqueue_delete_file(&self, event_id: i64, actor: &str) -> Result<AgentCommand> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String, String, i64)> = tx
+            .query_row(
+                "SELECT agent_id, path, file_deleted FROM events WHERE id = ?1",
+                params![event_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((agent_id, target_path, file_deleted)) = row else {
+            anyhow::bail!("告警记录 {event_id} 不存在");
+        };
+        if target_path.trim().is_empty() {
+            anyhow::bail!("该告警缺少文件路径，无法下发删除指令");
+        }
+        if file_deleted != 0 {
+            anyhow::bail!("该文件已标记为删除");
+        }
+        let existing: Option<(i64, i64, i64)> = tx
+            .query_row(
+                "SELECT id, created_at, updated_at FROM agent_commands
+                 WHERE agent_id = ?1 AND action = 'delete_file' AND target_path = ?2 AND status = 'pending'
+                 LIMIT 1",
+                params![agent_id, target_path],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((id, created_at, updated_at)) = existing {
+            tx.commit()?;
+            return Ok(AgentCommand {
+                id,
+                agent_id,
+                action: "delete_file".to_string(),
+                target_path,
+                status: "pending".to_string(),
+                message: String::new(),
+                created_at,
+                updated_at,
+            });
+        }
+        let now = crate::util::now_ts();
+        tx.execute(
+            "INSERT INTO agent_commands(agent_id, action, target_path, status, message, created_by, created_at, updated_at)
+             VALUES(?1, 'delete_file', ?2, 'pending', '', ?3, ?4, ?4)",
+            params![agent_id, target_path, actor, now],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO audit_log(at, actor, action, detail) VALUES(?1, ?2, 'delete_file', ?3)",
+            params![now, actor, format!("agent={agent_id} path={target_path}")],
+        )?;
+        tx.commit()?;
+        Ok(AgentCommand {
+            id,
+            agent_id,
+            action: "delete_file".to_string(),
+            target_path,
+            status: "pending".to_string(),
+            message: String::new(),
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    /// 客户端拉取属于本机的待执行指令。
+    pub fn pending_commands_for_agent(&self, agent_id: &str) -> Result<Vec<AgentCommand>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, agent_id, action, target_path, status, message, created_at, updated_at
+             FROM agent_commands
+             WHERE agent_id = ?1 AND status = 'pending'
+             ORDER BY id ASC LIMIT 50",
+        )?;
+        let rows = stmt.query_map(params![agent_id.trim()], |row| {
+            Ok(AgentCommand {
+                id: row.get(0)?,
+                agent_id: row.get(1)?,
+                action: row.get(2)?,
+                target_path: row.get(3)?,
+                status: row.get(4)?,
+                message: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// 客户端回传指令执行结果；若删除成功则将该终端对应路径的告警标记为已删除。
+    pub fn ack_command(
+        &self,
+        agent_id: &str,
+        command_id: i64,
+        status: &str,
+        message: &str,
+    ) -> Result<()> {
+        let status = match status {
+            "done" => "done",
+            _ => "failed",
+        };
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let target: Option<(String, String)> = tx
+            .query_row(
+                "SELECT action, target_path FROM agent_commands WHERE id = ?1 AND agent_id = ?2",
+                params![command_id, agent_id.trim()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((action, target_path)) = target else {
+            tx.commit()?;
+            return Ok(());
+        };
+        let now = crate::util::now_ts();
+        tx.execute(
+            "UPDATE agent_commands SET status = ?1, message = ?2, updated_at = ?3 WHERE id = ?4",
+            params![status, message.trim(), now, command_id],
+        )?;
+        if status == "done" && action == "delete_file" {
+            tx.execute(
+                "UPDATE events SET file_deleted = 1 WHERE agent_id = ?1 AND path = ?2",
+                params![agent_id.trim(), target_path],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 }
 
@@ -849,5 +1014,6 @@ fn map_event(row: &Row<'_>) -> rusqlite::Result<ServerEvent> {
         snippet: row.get(14)?,
         event_time: row.get(15)?,
         received_at: row.get(16)?,
+        file_deleted: row.get::<_, i64>(17).unwrap_or(0) != 0,
     })
 }

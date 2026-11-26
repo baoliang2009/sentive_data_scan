@@ -10,9 +10,11 @@ pub mod auth;
 pub mod config;
 pub mod http;
 pub mod ingest;
+pub mod report;
 pub mod rules;
 pub mod store;
 pub mod tls;
+pub mod webhook;
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -70,6 +72,7 @@ pub struct AppState {
     pub store: Arc<ServerStore>,
     pub auth: Arc<AuthState>,
     pub ingest_stats: Arc<ingest::IngestStats>,
+    pub webhook: Option<Arc<webhook::WebhookDispatcher>>,
     pub started_at: Instant,
     pub stopped: Arc<AtomicBool>,
     pub config_path: PathBuf,
@@ -151,8 +154,9 @@ pub fn run(config_path: Option<PathBuf>) -> Result<()> {
         );
     }
 
+    let webhook = webhook::WebhookDispatcher::spawn(&config.webhook);
     let stats = if config.ingest.enabled {
-        ingest::spawn(&config, Arc::clone(&store))?
+        ingest::spawn_with_webhook(&config, Arc::clone(&store), webhook.clone())?
     } else {
         Arc::new(ingest::IngestStats::default())
     };
@@ -166,6 +170,7 @@ pub fn run(config_path: Option<PathBuf>) -> Result<()> {
         store,
         auth,
         ingest_stats: stats,
+        webhook,
         started_at: Instant::now(),
         stopped: Arc::new(AtomicBool::new(false)),
         config_path: path,

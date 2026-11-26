@@ -554,7 +554,16 @@
               esc(event.path || '') +
               '" data-value="' +
               esc(event.matched || event.masked || '') +
-              '">加白名单</button>' +
+              '">加白名单</button> ' +
+              (event.file_deleted
+                ? '<span class="pill">已删除</span>'
+                : event.path
+                  ? '<button class="btn btn-sm" data-action="delete-event-file" data-id="' +
+                    esc(event.id) +
+                    '" data-path="' +
+                    esc(event.path) +
+                    '">删除文件</button>'
+                  : '') +
               '</td>' +
               '</tr>'
             );
@@ -581,6 +590,8 @@
       esc(state.filters.q) +
       '">' +
       '<span class="spacer"></span>' +
+      '<button class="btn btn-sm" data-action="export-csv">导出 CSV</button>' +
+      '<button class="btn btn-sm" data-action="export-html">导出 HTML</button>' +
       '<button class="btn btn-sm" data-action="reset-filters">重置</button>' +
       '</div>' +
       '<div class="table-wrap"><table class="grid"><thead><tr>' +
@@ -1159,6 +1170,22 @@
       '</div><div class="small muted" style="margin-top:10px">' +
       '客户端拉取规则：GET /api/agent/rules（Authorization: Bearer &lt;Agent Token&gt;）' +
       '</div></div></section>' +
+      '<section class="card"><div class="card-head"><div><h2>主动告警推送（Webhook）</h2>' +
+      '<div class="small muted" style="margin-top:2px">配置位于 server.toml [webhook] 段，收到高危告警时主动推送到企业微信 / 钉钉 / 飞书</div></div>' +
+      '<button class="btn btn-sm" data-action="test-webhook">发送测试告警</button></div>' +
+      '<div class="stat-grid">' +
+      '<div class="stat-card"><div class="stat-label">状态</div><div class="stat-value" style="font-size:18px">' +
+      (config.webhook && config.webhook.enabled ? '已启用' : '已关闭') +
+      '</div><div class="stat-hint">' +
+      esc((config.webhook && config.webhook.format) || 'generic') +
+      '</div></div>' +
+      '<div class="stat-card"><div class="stat-label">最低推送级别</div><div class="stat-value" style="font-size:18px">' +
+      esc(SEVERITY_LABEL[(config.webhook && config.webhook.min_severity) || 'high'] || '高危') +
+      '</div></div>' +
+      '<div class="stat-card"><div class="stat-label">Webhook 地址</div><div class="stat-value" style="font-size:18px">' +
+      (config.webhook && config.webhook.has_url ? '已配置' : '未配置') +
+      '</div></div>' +
+      '</div></section>' +
       '<section class="card"><div class="card-head"><div><h2>数据维护</h2>' +
       '<div class="small muted" style="margin-top:2px">清理不可恢复，请谨慎操作</div></div>' +
       '<button class="btn btn-sm" data-action="purge">清理过期告警</button></div>' +
@@ -1301,6 +1328,40 @@
         publishRules(config, '保存规则 ' + rule.id);
         break;
       }
+      case 'export-csv':
+      case 'export-html': {
+        var fmt = action === 'export-html' ? 'html' : 'csv';
+        var qParams = ['format=' + fmt];
+        if (state.filters.user) qParams.push('user=' + encodeURIComponent(state.filters.user));
+        if (state.filters.category) qParams.push('category=' + encodeURIComponent(state.filters.category));
+        if (state.filters.severity) qParams.push('severity=' + encodeURIComponent(state.filters.severity));
+        if (state.filters.q) qParams.push('q=' + encodeURIComponent(state.filters.q));
+        window.open('/api/events/export?' + qParams.join('&'), '_blank');
+        break;
+      }
+      case 'delete-event-file': {
+        var evId = Number(actionEl.dataset.id);
+        var filePath = actionEl.dataset.path || '';
+        confirmDialog(
+          '删除客户端敏感文件？',
+          '确定向该终端下发删除指令，永久删除本地文件「' + filePath + '」吗？此操作不可恢复。',
+          function () {
+            api('/api/events/delete-file', { method: 'POST', body: { event_id: evId } })
+              .then(function () {
+                toast('已下发删除指令，等待客户端同步执行');
+              })
+              .catch(showError);
+          }
+        );
+        break;
+      }
+      case 'test-webhook':
+        api('/api/webhook/test', { method: 'POST', body: {} })
+          .then(function () {
+            toast('测试告警已发送');
+          })
+          .catch(showError);
+        break;
       case 'save-policy':
         publishRules(currentRulesConfig(), '更新客户端扫描策略与白名单', currentPolicyConfig());
         break;

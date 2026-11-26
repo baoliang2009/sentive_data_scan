@@ -113,6 +113,164 @@ pub fn fetch_policy(config: &Config) -> Result<Option<SyncedBundle>> {
     Ok(Some(bundle))
 }
 
+/// 服务端下发的远端指令。
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoteCommand {
+    pub id: i64,
+    pub action: String,
+    pub target_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommandsResp {
+    #[serde(default)]
+    items: Vec<RemoteCommand>,
+}
+
+/// 从服务端拉取待执行的远程指令。
+pub fn fetch_commands(config: &Config, identity: &Identity) -> Result<Vec<RemoteCommand>> {
+    let Some(base_url) = resolve_server_url(config) else {
+        return Ok(Vec::new());
+    };
+    let token = config.server.agent_token.trim();
+    if token.is_empty() {
+        return Ok(Vec::new());
+    }
+    let path = format!(
+        "/api/agent/commands?agent_id={}",
+        percent_encode(&identity.agent_id)
+    );
+    let (status, body) = http_request(
+        "GET",
+        &base_url,
+        &path,
+        token,
+        None,
+        config.server.insecure_tls,
+    )?;
+    if !(200..300).contains(&status) {
+        bail!("拉取远程指令失败：HTTP {status}");
+    }
+    let resp: CommandsResp = serde_json::from_slice(&body).context("解析远程指令 JSON 失败")?;
+    Ok(resp.items)
+}
+
+/// 回传远程指令执行结果。
+pub fn ack_command(
+    config: &Config,
+    identity: &Identity,
+    command_id: i64,
+    status_str: &str,
+    message: &str,
+) -> Result<()> {
+    let Some(base_url) = resolve_server_url(config) else {
+        return Ok(());
+    };
+    let token = config.server.agent_token.trim();
+    if token.is_empty() {
+        return Ok(());
+    }
+    let payload = serde_json::json!({
+        "agent_id": identity.agent_id,
+        "command_id": command_id,
+        "status": status_str,
+        "message": message,
+    });
+    let body = serde_json::to_vec(&payload)?;
+    let (status, _) = http_request(
+        "POST",
+        &base_url,
+        "/api/agent/commands/ack",
+        token,
+        Some(&body),
+        config.server.insecure_tls,
+    )?;
+    if !(200..300).contains(&status) {
+        bail!("回传指令状态失败：HTTP {status}");
+    }
+    Ok(())
+}
+
+/// 拉取并安全执行服务端下发的远程删除文件指令。
+pub fn process_remote_commands(base_config: &Config, active_config: &Config, store: &Store) {
+    let Ok(identity) = Identity::load_or_create(store, active_config) else {
+        return;
+    };
+    let commands = match fetch_commands(base_config, &identity) {
+        Ok(items) => items,
+        Err(error) => {
+            tracing::debug!(error = %error, "拉取远程指令失败");
+            return;
+        }
+    };
+    for cmd in commands {
+        if cmd.action != "delete_file" {
+            let _ = ack_command(
+                base_config,
+                &identity,
+                cmd.id,
+                "failed",
+                &format!("不支持的指令: {}", cmd.action),
+            );
+            continue;
+        }
+        match safe_delete_file(active_config, store, &cmd.target_path) {
+            Ok(msg) => {
+                tracing::info!(path = %cmd.target_path, "已根据服务端指令删除敏感文件");
+                let _ = ack_command(base_config, &identity, cmd.id, "done", &msg);
+            }
+            Err(error) => {
+                tracing::warn!(path = %cmd.target_path, error = %error, "执行服务端删除文件指令失败");
+                let _ = ack_command(
+                    base_config,
+                    &identity,
+                    cmd.id,
+                    "failed",
+                    &format!("{error:#}"),
+                );
+            }
+        }
+    }
+}
+
+fn safe_delete_file(config: &Config, store: &Store, raw_path: &str) -> Result<String> {
+    let target = std::path::PathBuf::from(raw_path);
+    if !target.is_absolute() {
+        bail!("拒绝非绝对路径");
+    }
+    let canonical = dunce::canonicalize(&target).unwrap_or_else(|_| target.clone());
+    let in_roots = config.effective_roots().iter().any(|root| {
+        let root_canon = dunce::canonicalize(root).unwrap_or_else(|_| root.clone());
+        canonical.starts_with(&root_canon)
+    });
+    let in_store = store.has_file_or_finding(&target) || store.has_file_or_finding(&canonical);
+    if !in_roots && !in_store {
+        bail!("目标文件不在受管目录或扫描台账中，已拒绝删除");
+    }
+    if !target.exists() {
+        let _ = store.remove_file(&target);
+        return Ok("文件已不存在，已清理本地台账".to_string());
+    }
+    if !target.is_file() {
+        bail!("目标不是普通文件，拒绝删除");
+    }
+    std::fs::remove_file(&target).with_context(|| format!("删除文件失败: {}", target.display()))?;
+    let _ = store.remove_file(&target);
+    Ok("已删除文件".to_string())
+}
+
+fn percent_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 /// 向服务端上报当前客户端已应用的策略版本。
 pub fn report_revision(config: &Config, identity: &Identity, revision: i64) -> Result<()> {
     let Some(base_url) = resolve_server_url(config) else {
@@ -199,6 +357,29 @@ fn http_request(
 ) -> Result<(u16, Vec<u8>)> {
     let parsed = parse_url(base_url)?;
     let full_path = format!("{}{}", parsed.base_path, path);
+    http_request_parts(&parsed, method, &full_path, bearer, body, insecure_tls)
+}
+
+/// 供服务端 Webhook 等组件使用的轻量 JSON POST。
+pub fn post_json(url: &str, body: &[u8], insecure_tls: bool) -> Result<u16> {
+    let parsed = parse_url(url)?;
+    let path = if parsed.base_path.is_empty() {
+        "/"
+    } else {
+        parsed.base_path
+    };
+    let (status, _) = http_request_parts(&parsed, "POST", path, "", Some(body), insecure_tls)?;
+    Ok(status)
+}
+
+fn http_request_parts(
+    parsed: &ParsedUrl<'_>,
+    method: &str,
+    full_path: &str,
+    bearer: &str,
+    body: Option<&[u8]>,
+    insecure_tls: bool,
+) -> Result<(u16, Vec<u8>)> {
     let addr = (parsed.host, parsed.port)
         .to_socket_addrs()
         .with_context(|| format!("解析服务端地址失败：{}:{}", parsed.host, parsed.port))?

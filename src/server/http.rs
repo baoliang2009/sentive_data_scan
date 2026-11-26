@@ -159,17 +159,21 @@ fn serve<S: Read + Write>(stream: &mut S, state: &AppState, remote: String) {
         Ok(None) => return,
         Err(error) => {
             let (status, ctype, body) = api::error_response(400, error);
-            respond(stream, status, ctype, &body, &[]);
+            respond(stream, status, ctype, &body, &[], &[]);
             return;
         }
     };
 
-    let (status, ctype, body, cookies) = route(&request, state);
-    respond(stream, status, ctype, &body, &cookies);
+    let (status, ctype, body, cookies, headers) = route(&request, state);
+    respond(stream, status, ctype, &body, &cookies, &headers);
 }
 
-fn route(request: &Request, state: &AppState) -> (u16, &'static str, Vec<u8>, Vec<String>) {
+fn route(
+    request: &Request,
+    state: &AppState,
+) -> (u16, &'static str, Vec<u8>, Vec<String>, Vec<(String, String)>) {
     let mut cookies = Vec::new();
+    let mut extra_headers = Vec::new();
     let (status, ctype, body) = match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") | ("GET", "/index.html") => {
             (200, "text/html; charset=utf-8", index_html().into_bytes())
@@ -209,6 +213,17 @@ fn route(request: &Request, state: &AppState) -> (u16, &'static str, Vec<u8>, Ve
             }
             response
         }
+        // 报表下载接口（需管理员会话）
+        ("GET", "/api/events/export") => match api::authorize(&state.auth, request) {
+            Ok(_) => {
+                let (status, ctype, body, disposition) = api::export_events(request, state);
+                if let Some(disp) = disposition {
+                    extra_headers.push(("Content-Disposition".to_string(), disp));
+                }
+                (status, ctype, body)
+            }
+            Err(response) => response,
+        },
         // Agent 侧接口：只认共享 Token，不走控制台会话。
         (_, path) if path.starts_with("/api/agent/") => api::handle_agent(request, state),
         (_, path) if path.starts_with("/api/") => match api::authorize(&state.auth, request) {
@@ -218,7 +233,7 @@ fn route(request: &Request, state: &AppState) -> (u16, &'static str, Vec<u8>, Ve
         ("GET", _) => (404, "text/plain; charset=utf-8", b"Not Found".to_vec()),
         _ => api::error_response(405, "不支持的方法"),
     };
-    (status, ctype, body, cookies)
+    (status, ctype, body, cookies, extra_headers)
 }
 
 fn index_html() -> String {
@@ -308,6 +323,7 @@ fn respond<S: Write>(
     content_type: &str,
     body: &[u8],
     cookies: &[String],
+    extra_headers: &[(String, String)],
 ) {
     let reason = match status {
         200 => "OK",
@@ -333,6 +349,12 @@ fn respond<S: Write>(
     for cookie in cookies {
         head.push_str("Set-Cookie: ");
         head.push_str(cookie);
+        head.push_str("\r\n");
+    }
+    for (name, value) in extra_headers {
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
         head.push_str("\r\n");
     }
     head.push_str("\r\n");

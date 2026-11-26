@@ -163,6 +163,45 @@ pub fn handle_agent(request: &Request, state: &AppState) -> (u16, &'static str, 
                 Err(error) => fail(error),
             }
         }
+        // 客户端拉取待执行的远程指令（如删除敏感文件）。
+        ("GET", "/api/agent/commands") => {
+            if !authorize_agent(&state.auth, request) {
+                return error_response(401, "Agent Token 无效");
+            }
+            let params = request.query_params();
+            let agent_id = params.get("agent_id").map(String::as_str).unwrap_or("");
+            if agent_id.trim().is_empty() {
+                return error_response(400, "缺少 agent_id");
+            }
+            match state.store.pending_commands_for_agent(agent_id) {
+                Ok(commands) => ok(json!({ "items": commands })),
+                Err(error) => fail(error),
+            }
+        }
+        // 客户端回传指令执行结果。
+        ("POST", "/api/agent/commands/ack") => {
+            if !authorize_agent(&state.auth, request) {
+                return error_response(401, "Agent Token 无效");
+            }
+            let body = match request.json() {
+                Ok(body) => body,
+                Err(error) => return error_response(400, error),
+            };
+            let agent_id = body.get("agent_id").and_then(Value::as_str).unwrap_or("");
+            let command_id = body.get("command_id").and_then(Value::as_i64).unwrap_or(0);
+            let status = body.get("status").and_then(Value::as_str).unwrap_or("failed");
+            let message = body.get("message").and_then(Value::as_str).unwrap_or("");
+            if agent_id.trim().is_empty() || command_id <= 0 {
+                return error_response(400, "缺少 agent_id 或 command_id");
+            }
+            match state
+                .store
+                .ack_command(agent_id, command_id, status, message)
+            {
+                Ok(()) => ok(json!({ "ok": true })),
+                Err(error) => fail(error),
+            }
+        }
         _ => error_response(404, "Agent 接口不存在"),
     }
 }
@@ -204,6 +243,20 @@ pub fn handle(request: &Request, state: &AppState, actor: &str) -> (u16, &'stati
             Ok(value) => ok(value),
             Err(error) => fail(error),
         },
+
+        ("POST", "/api/events/delete-file") => {
+            let body = match request.json() {
+                Ok(body) => body,
+                Err(error) => return error_response(400, error),
+            };
+            let Some(event_id) = body.get("event_id").and_then(Value::as_i64) else {
+                return error_response(400, "缺少 event_id");
+            };
+            match state.store.enqueue_delete_file(event_id, actor) {
+                Ok(cmd) => ok(json!({ "ok": true, "command": cmd })),
+                Err(error) => error_response(400, format!("{error:#}")),
+            }
+        }
 
         ("GET", "/api/agents") => match state.store.agents() {
             Ok(agents) => ok(json!({ "items": agents })),
@@ -365,9 +418,23 @@ pub fn handle(request: &Request, state: &AppState, actor: &str) -> (u16, &'stati
                     state.config.discover.instance.clone()
                 },
             },
+            "webhook": {
+                "enabled": state.config.webhook.enabled,
+                "format": state.config.webhook.format,
+                "min_severity": state.config.webhook.min_severity.as_str(),
+                "has_url": !state.config.webhook.url.trim().is_empty(),
+            },
             "console_bind": state.config.server.bind,
             "version": env!("CARGO_PKG_VERSION"),
         })),
+
+        ("POST", "/api/webhook/test") => match &state.webhook {
+            Some(dispatcher) => match dispatcher.send_test() {
+                Ok(()) => ok(json!({ "ok": true })),
+                Err(error) => error_response(502, format!("Webhook 推送失败：{error:#}")),
+            },
+            None => error_response(400, "Webhook 未启用或 url 为空，请在 server.toml [webhook] 中配置"),
+        },
 
         ("POST", "/api/purge") => {
             let body = request.json().unwrap_or(Value::Null);
@@ -444,6 +511,41 @@ fn filter_from_query(params: &std::collections::HashMap<String, String>) -> Even
 /// 5 分钟窗口内最多保留这么多来源；不设上限时，攻击者伪造大量来源
 /// （或 IPv6 地址轮换）就能让这张内存表无限增长。
 const MAX_THROTTLE_ENTRIES: usize = 4096;
+
+/// 导出告警报表（CSV 或 HTML）。
+pub fn export_events(
+    request: &Request,
+    state: &AppState,
+) -> (u16, &'static str, Vec<u8>, Option<String>) {
+    let params = request.query_params();
+    let format = params
+        .get("format")
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "csv".to_string());
+    let mut filter = filter_from_query(&params);
+    filter.limit = Some(10_000);
+    filter.offset = Some(0);
+    let (events, total) = match state.store.events(&filter) {
+        Ok(res) => res,
+        Err(error) => {
+            let (status, ctype, body) = fail(error);
+            return (status, ctype, body, None);
+        }
+    };
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    match format.as_str() {
+        "html" => {
+            let body = crate::server::report::render_html(&events, total);
+            let disp = format!("attachment; filename=\"sentinel-report-{ts}.html\"");
+            (200, "text/html; charset=utf-8", body, Some(disp))
+        }
+        _ => {
+            let body = crate::server::report::render_csv(&events);
+            let disp = format!("attachment; filename=\"sentinel-report-{ts}.csv\"");
+            (200, "text/csv; charset=utf-8", body, Some(disp))
+        }
+    }
+}
 
 /// 登录失败限流状态（简单的内存计数，够防暴力破解）。
 pub struct LoginThrottle {

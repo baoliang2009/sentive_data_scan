@@ -72,3 +72,13 @@ service = "_datasentinel._udp.local."
 
 # 实例名；空则使用 DataSentinel-<主机名>，同网段多台服务端靠它区分。
 instance = ""
+
+[webhook]
+# 服务端主动推送告警开关（企业微信 / 钉钉 / 飞书 / 通用 JSON Webhook）
+enabled = false
+url = ""
+# generic / wecom / dingtalk / feishu
+format = "generic"
+# 推送最低级别：low / medium / high / critical
+min_severity = "high"
+insecure_tls = false

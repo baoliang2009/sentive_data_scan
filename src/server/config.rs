@@ -23,6 +23,30 @@ pub struct ServerConfig {
     pub retention: RetentionConfig,
     pub tls: TlsConfig,
     pub discover: DiscoverConfig,
+    pub webhook: WebhookConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebhookConfig {
+    pub enabled: bool,
+    pub url: String,
+    /// `generic` / `wecom` / `dingtalk` / `feishu`
+    pub format: String,
+    pub min_severity: crate::model::Severity,
+    pub insecure_tls: bool,
+}
+
+impl Default for WebhookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: String::new(),
+            format: "generic".to_string(),
+            min_severity: crate::model::Severity::High,
+            insecure_tls: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

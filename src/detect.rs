@@ -74,7 +74,10 @@ impl Detector {
             return self.extract_office(path, &extension);
         }
         if extension == "pdf" {
-            return Ok(ExtractOutcome::Skip("PDF 暂不支持"));
+            if !self.office_documents {
+                return Ok(ExtractOutcome::Skip("文档抽取已关闭"));
+            }
+            return self.extract_pdf(path);
         }
         if matches!(extension.as_str(), "doc" | "xls" | "ppt") {
             return Ok(ExtractOutcome::Skip("旧版 Office 格式暂不支持"));
@@ -110,10 +113,53 @@ impl Detector {
         )
     }
 
+    fn extract_pdf(&self, path: &Path) -> Result<ExtractOutcome> {
+        let bytes =
+            fs::read(path).with_context(|| format!("无法读取 PDF 文件 {}", path.display()))?;
+        let content_hash = sha256_hex(&bytes);
+        let mut text = match std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&bytes)) {
+            Ok(Ok(text)) => text,
+            Ok(Err(error)) => {
+                tracing::debug!(path = %path.display(), error = %error, "PDF 文本抽取失败");
+                return Ok(ExtractOutcome::Skip("PDF 无法解析或已加密"));
+            }
+            Err(_) => {
+                tracing::warn!(path = %path.display(), "PDF 解析触发异常，已跳过");
+                return Ok(ExtractOutcome::Skip("PDF 解析异常"));
+            }
+        };
+        if text.len() > MAX_OFFICE_TEXT_BYTES {
+            let cut = crate::util::floor_char_boundary(&text, MAX_OFFICE_TEXT_BYTES);
+            text.truncate(cut);
+        }
+        if text.trim().is_empty() {
+            return Ok(ExtractOutcome::Skip("PDF 无可提取文本（可能是扫描图片）"));
+        }
+        Ok(ExtractOutcome::Content(Extracted {
+            text,
+            content_hash,
+            kind: "pdf",
+        }))
+    }
+
     fn extract_office(&self, path: &Path, extension: &str) -> Result<ExtractOutcome> {
         let bytes =
             fs::read(path).with_context(|| format!("无法读取 Office 文件 {}", path.display()))?;
         let content_hash = sha256_hex(&bytes);
+        if !bytes.starts_with(b"PK\x03\x04") {
+            if bytes.starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) {
+                let text = extract_ole2_text(&bytes);
+                if text.trim().is_empty() {
+                    return Ok(ExtractOutcome::Skip("旧版 WPS 文档没有可提取文本"));
+                }
+                return Ok(ExtractOutcome::Content(Extracted {
+                    text,
+                    content_hash,
+                    kind: "wps-ole2",
+                }));
+            }
+            return Ok(ExtractOutcome::Skip("不支持的 Office/WPS 容器格式"));
+        }
         let cursor = Cursor::new(bytes);
         let mut archive = ZipArchive::new(cursor)
             .with_context(|| format!("无法解析 Office 容器 {}", path.display()))?;
@@ -181,22 +227,77 @@ pub fn file_extension(path: &Path) -> String {
 }
 
 pub fn is_office_extension(extension: &str) -> bool {
-    matches!(extension, "docx" | "xlsx" | "pptx")
+    matches!(extension, "docx" | "xlsx" | "pptx" | "wps" | "et" | "dps")
 }
 
 fn is_office_content(name: &str, extension: &str) -> bool {
     match extension {
-        "docx" => {
+        "docx" | "wps" => {
             name == "word/document.xml"
                 || name.starts_with("word/header")
                 || name.starts_with("word/footer")
                 || name.starts_with("word/footnotes")
                 || name.starts_with("word/endnotes")
         }
-        "xlsx" => name == "xl/sharedStrings.xml" || name.starts_with("xl/worksheets/sheet"),
-        "pptx" => name.starts_with("ppt/slides/slide"),
+        "xlsx" | "et" => name == "xl/sharedStrings.xml" || name.starts_with("xl/worksheets/sheet"),
+        "pptx" | "dps" => name.starts_with("ppt/slides/slide"),
         _ => false,
     }
+}
+
+/// 从旧版 WPS（OLE2 复合文档）中抽取连续可读文本（UTF-16LE 与 ASCII/UTF-8）。
+fn extract_ole2_text(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    // 1. 提取 UTF-16LE 可读段（至少 4 个连续字符，覆盖中文与英文正文）
+    let mut utf16_run: Vec<u16> = Vec::new();
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        let unit = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+        let ch = char::from_u32(unit as u32);
+        let readable = matches!(
+            ch,
+            Some(c) if (c.is_ascii_graphic() || c == ' ' || ('\u{4E00}'..='\u{9FFF}').contains(&c) || ('\u{3000}'..='\u{303F}').contains(&c) || ('\u{FF00}'..='\u{FFEF}').contains(&c))
+        );
+        if readable {
+            utf16_run.push(unit);
+            i += 2;
+        } else {
+            if utf16_run.len() >= 4 {
+                out.push_str(&String::from_utf16_lossy(&utf16_run));
+                out.push('\n');
+            }
+            utf16_run.clear();
+            i += 2;
+        }
+    }
+    if utf16_run.len() >= 4 {
+        out.push_str(&String::from_utf16_lossy(&utf16_run));
+        out.push('\n');
+    }
+
+    // 2. 提取单字节 ASCII 可读段（至少 6 个连续字符，兜底数字/邮箱/密钥）
+    let mut ascii_run: Vec<u8> = Vec::new();
+    for &b in bytes {
+        if b.is_ascii_graphic() || b == b' ' {
+            ascii_run.push(b);
+        } else {
+            if ascii_run.len() >= 6 {
+                out.push_str(&String::from_utf8_lossy(&ascii_run));
+                out.push('\n');
+            }
+            ascii_run.clear();
+        }
+    }
+    if ascii_run.len() >= 6 {
+        out.push_str(&String::from_utf8_lossy(&ascii_run));
+        out.push('\n');
+    }
+
+    if out.len() > MAX_OFFICE_TEXT_BYTES {
+        let cut = crate::util::floor_char_boundary(&out, MAX_OFFICE_TEXT_BYTES);
+        out.truncate(cut);
+    }
+    out
 }
 
 pub fn looks_binary(bytes: &[u8]) -> bool {
@@ -369,8 +470,23 @@ mod tests {
     #[test]
     fn office_extension_check() {
         assert!(is_office_extension("docx"));
+        assert!(is_office_extension("wps"));
+        assert!(is_office_extension("et"));
+        assert!(is_office_extension("dps"));
         assert!(!is_office_extension("doc"));
         assert!(is_office_content("word/document.xml", "docx"));
+        assert!(is_office_content("word/document.xml", "wps"));
         assert!(!is_office_content("word/styles.xml", "docx"));
+    }
+
+    #[test]
+    fn ole2_text_extraction_finds_utf16_and_ascii() {
+        let mut raw = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1, 0x00, 0x00];
+        for unit in "身份证 11010519491231002X".encode_utf16() {
+            raw.extend_from_slice(&unit.to_le_bytes());
+        }
+        raw.extend_from_slice(&[0x00, 0x00]);
+        let extracted = extract_ole2_text(&raw);
+        assert!(extracted.contains("11010519491231002X"));
     }
 }

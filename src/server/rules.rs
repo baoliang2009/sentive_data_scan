@@ -515,4 +515,49 @@ mod tests {
         assert!(store.agents().unwrap().is_empty());
         assert_eq!(store.rules_history(100).unwrap().len(), 2);
     }
+
+    #[test]
+    fn delete_file_command_lifecycle() {
+        use crate::server::store::{EventFilter, IncomingBatch, IncomingFinding};
+        let dir = tempfile::tempdir().unwrap();
+        let store = ServerStore::open(&dir.path().join("server.db")).unwrap();
+        let batch = IncomingBatch {
+            agent_id: "agent-del".to_string(),
+            hostname: "pc-del".to_string(),
+            username: "bob".to_string(),
+            platform: "macos".to_string(),
+            version: "0.3.0".to_string(),
+            rule_revision: 1,
+            findings: vec![IncomingFinding {
+                rule_id: "cn_mobile".to_string(),
+                rule_name: "手机".to_string(),
+                category: "contact".to_string(),
+                severity: "high".to_string(),
+                masked: "138********5678".to_string(),
+                matched: "13812345678".to_string(),
+                file_name: "leak.txt".to_string(),
+                path: "/tmp/leak.txt".to_string(),
+                line: 1,
+                column: 1,
+                snippet: String::new(),
+                match_hash: "h-del".to_string(),
+                time: String::new(),
+            }],
+        };
+        store.ingest(&batch, "127.0.0.1").unwrap();
+        let (events, _) = store.events(&EventFilter::default()).unwrap();
+        let cmd = store.enqueue_delete_file(events[0].id, "admin").unwrap();
+        assert_eq!(cmd.status, "pending");
+
+        let pending = store.pending_commands_for_agent("agent-del").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].target_path, "/tmp/leak.txt");
+
+        store
+            .ack_command("agent-del", cmd.id, "done", "已删除文件")
+            .unwrap();
+        assert!(store.pending_commands_for_agent("agent-del").unwrap().is_empty());
+        let (events_after, _) = store.events(&EventFilter::default()).unwrap();
+        assert!(events_after[0].file_deleted);
+    }
 }
