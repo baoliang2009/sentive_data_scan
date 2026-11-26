@@ -171,7 +171,7 @@ url = ""
 # 与服务端 auth.agent_token 一致的共享 Token
 agent_token = ""
 # 拉取策略间隔（秒）
-sync_interval_secs = 60
+sync_interval_secs = 15
 # 服务端使用自签证书且未导入系统信任库时设为 true
 insecure_tls = false
 

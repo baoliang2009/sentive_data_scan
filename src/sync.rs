@@ -136,7 +136,7 @@ pub fn fetch_commands(config: &Config, identity: &Identity) -> Result<Vec<Remote
     };
     let token = config.server.agent_token.trim();
     if token.is_empty() {
-        return Ok(Vec::new());
+        bail!("未配置 [server] agent_token，无法拉取服务端远程指令");
     }
     let path = format!(
         "/api/agent/commands?agent_id={}",
@@ -150,6 +150,9 @@ pub fn fetch_commands(config: &Config, identity: &Identity) -> Result<Vec<Remote
         None,
         config.server.insecure_tls,
     )?;
+    if status == 401 {
+        bail!("拉取远程指令鉴权失败（401），请检查 [server] agent_token");
+    }
     if !(200..300).contains(&status) {
         bail!("拉取远程指令失败：HTTP {status}");
     }
@@ -201,7 +204,7 @@ pub fn process_remote_commands(base_config: &Config, active_config: &Config, sto
     let commands = match fetch_commands(base_config, &identity) {
         Ok(items) => items,
         Err(error) => {
-            tracing::debug!(error = %error, "拉取远程指令失败");
+            tracing::warn!(error = %error, "拉取服务端远程指令失败");
             return;
         }
     };
@@ -537,5 +540,34 @@ impl ServerCertVerifier for NoVerify {
             SignatureScheme::RSA_PSS_SHA384,
             SignatureScheme::RSA_PSS_SHA512,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_delete_removes_managed_file_and_blocks_outside_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let managed = dir.path().join("managed");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let target = managed.join("leak.txt");
+        let untrusted = outside.join("system.txt");
+        std::fs::write(&target, "secret").unwrap();
+        std::fs::write(&untrusted, "keep").unwrap();
+
+        let store = Store::open(&dir.path().join("sentinel.db")).unwrap();
+        let mut cfg = Config::default();
+        cfg.scan.roots = vec![managed];
+
+        assert!(safe_delete_file(&cfg, &store, &untrusted.to_string_lossy()).is_err());
+        assert!(untrusted.exists());
+
+        safe_delete_file(&cfg, &store, &target.to_string_lossy()).unwrap();
+        assert!(!target.exists());
     }
 }

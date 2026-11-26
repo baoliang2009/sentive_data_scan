@@ -183,7 +183,8 @@ fn run_loop(
     let debounce = Duration::from_millis(active_config.watch.debounce_ms.max(200));
     let max_pending = active_config.watch.max_pending.max(100);
     let mut interval = scan_interval(&active_config);
-    let sync_interval = Duration::from_secs(base_config.server.sync_interval_secs.max(10));
+    let sync_interval = Duration::from_secs(base_config.server.sync_interval_secs.max(5));
+    let cmd_interval = Duration::from_secs(base_config.server.sync_interval_secs.clamp(5, 10));
 
     let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
     let mut last_full_scan = Instant::now();
@@ -192,6 +193,7 @@ fn run_loop(
     // 心跳：构造 Scanner 时已发过一次，这里负责长期保活。
     let mut last_heartbeat = Instant::now();
     let mut last_sync = Instant::now();
+    let mut last_cmd_poll = Instant::now();
     let heartbeat_interval = Duration::from_secs(HEARTBEAT_INTERVAL_SECS);
 
     while running.load(Ordering::SeqCst) {
@@ -248,10 +250,15 @@ fn run_loop(
             last_heartbeat = Instant::now();
         }
 
-        // 定期向服务端拉取统一策略（扫描路径、定时周期、白名单与规则），变化时热更新，并处理远程指令。
+        // 定期轮询服务端远程指令（如删除敏感文件），保持较短间隔以快速响应。
+        if last_cmd_poll.elapsed() >= cmd_interval {
+            last_cmd_poll = Instant::now();
+            crate::sync::process_remote_commands(&base_config, &active_config, &store);
+        }
+
+        // 定期向服务端拉取统一策略（扫描路径、定时周期、白名单与规则），变化时热更新。
         if last_sync.elapsed() >= sync_interval {
             last_sync = Instant::now();
-            crate::sync::process_remote_commands(&base_config, &active_config, &store);
             match crate::sync::fetch_policy(&base_config) {
                 Ok(Some(bundle)) if current_bundle.as_ref() != Some(&bundle) => {
                     tracing::info!(revision = bundle.revision, "收到服务端新策略，正在热更新");
@@ -304,7 +311,7 @@ fn run_loop(
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    tracing::debug!(error = %error, "拉取服务端策略失败");
+                    tracing::warn!(error = %error, "拉取服务端策略失败");
                 }
             }
         }

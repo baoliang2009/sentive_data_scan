@@ -54,6 +54,7 @@ pub fn handle(request: &Request, ctx: &AppContext) -> Response {
         ("POST", "/api/notify/test") => notify_test(ctx),
         ("POST", "/api/syslog/test") => syslog_test(ctx, request),
         ("POST", "/api/syslog/discover") => syslog_discover(ctx, request),
+        ("POST", "/api/server/sync") => server_sync_now(ctx),
         ("GET", "/api/settings") => get_settings(ctx),
         ("POST", "/api/settings") => save_settings(ctx, request),
         ("GET", "/api/config") => get_config(ctx),
@@ -66,6 +67,20 @@ pub fn handle(request: &Request, ctx: &AppContext) -> Response {
 
 // ---------------------------------------------------------------- overview --
 
+fn effective_config_with_sync(config: &Config, store: &Store) -> Config {
+    let bundle = crate::sync::fetch_policy(config)
+        .ok()
+        .flatten()
+        .inspect(|b| {
+            let _ = crate::sync::save_cached(store, b);
+        })
+        .or_else(|| crate::sync::load_cached(store));
+    match bundle {
+        Some(b) => crate::sync::apply_bundle(config, &b),
+        None => config.clone(),
+    }
+}
+
 fn overview(ctx: &AppContext) -> Response {
     let config = match ctx.load_config() {
         Ok(config) => config,
@@ -75,6 +90,7 @@ fn overview(ctx: &AppContext) -> Response {
         Ok(store) => store,
         Err(error) => return fail(error),
     };
+    let effective = effective_config_with_sync(&config, &store);
     let stats = match store.stats() {
         Ok(stats) => stats,
         Err(error) => return fail(error),
@@ -126,8 +142,8 @@ fn overview(ctx: &AppContext) -> Response {
         "database_path": config.database_path().to_string_lossy(),
         "reports_dir": config.reports_dir().to_string_lossy(),
         "logs_dir": config.logs_dir().to_string_lossy(),
-        "roots": config.effective_roots().iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
-        "roots_auto": config.scan.roots.is_empty(),
+        "roots": effective.effective_roots().iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+        "roots_auto": effective.scan.roots.is_empty(),
         "stats": {
             "files": stats.files,
             "findings": stats.findings,
@@ -598,12 +614,13 @@ fn run_scan_batch(
     if !config.storage.store_raw_match {
         let _ = store.clear_raw_matches();
     }
-    let rules = RuleSet::build(&config.rules)?;
-    let mut scanner = Scanner::new(Arc::new(config.clone()), store, rules)?;
+    let effective = effective_config_with_sync(&config, &store);
+    let rules = RuleSet::build(&effective.rules)?;
+    let mut scanner = Scanner::new(Arc::new(effective.clone()), store, rules)?;
     scanner.set_progress(Arc::clone(&session.progress));
 
     let roots: Vec<PathBuf> = if requested.is_empty() {
-        config.effective_roots()
+        effective.effective_roots()
     } else {
         requested
             .iter()
@@ -883,6 +900,37 @@ fn open_target(ctx: &AppContext, request: &Request) -> Response {
 
 // ---------------------------------------------------------------- settings --
 
+fn server_sync_now(ctx: &AppContext) -> Response {
+    let config = match ctx.load_config() {
+        Ok(config) => config,
+        Err(error) => return fail(error),
+    };
+    let store = match ctx.store() {
+        Ok(store) => store,
+        Err(error) => return fail(error),
+    };
+    match crate::sync::fetch_policy(&config) {
+        Ok(Some(bundle)) => {
+            let _ = crate::sync::save_cached(&store, &bundle);
+            let effective = crate::sync::apply_bundle(&config, &bundle);
+            if let Ok(identity) = crate::identity::Identity::load_or_create(&store, &effective) {
+                let _ = crate::sync::report_revision(&config, &identity, bundle.revision);
+            }
+            crate::sync::process_remote_commands(&config, &effective, &store);
+            ok(json!({
+                "ok": true,
+                "revision": bundle.revision,
+                "scan_roots": effective.effective_roots().iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+            }))
+        }
+        Ok(None) => error_response(
+            400,
+            "未配置服务端地址，请填写「服务端地址」或启用 mDNS 自动发现",
+        ),
+        Err(error) => error_response(502, format!("{error:#}")),
+    }
+}
+
 fn get_settings(ctx: &AppContext) -> Response {
     let config = match ctx.load_config() {
         Ok(config) => config,
@@ -944,6 +992,13 @@ fn get_settings(ctx: &AppContext) -> Response {
             "disabled": config.rules.disabled,
             "custom_count": config.rules.custom.len(),
         },
+        "server": {
+            "enabled": config.server.enabled,
+            "url": config.server.url,
+            "agent_token": config.server.agent_token,
+            "sync_interval_secs": config.server.sync_interval_secs,
+            "insecure_tls": config.server.insecure_tls,
+        },
         "paths": {
             "config": config_path_text(&ctx.config_path),
             "database": config.database_path().to_string_lossy(),
@@ -997,6 +1052,11 @@ fn save_settings(ctx: &AppContext, request: &Request) -> Response {
     if let Some(rules) = body.get("rules") {
         for (key, value) in rules_object(rules) {
             push("rules", &key, &value);
+        }
+    }
+    if let Some(server) = body.get("server") {
+        for (key, value) in server_object(server) {
+            push("server", &key, &value);
         }
     }
 
@@ -1123,6 +1183,26 @@ fn rules_object(value: &Value) -> Vec<(String, Value)> {
     };
     let mut out = Vec::new();
     for key in ["min_severity", "disabled"] {
+        if let Some(value) = map.get(key) {
+            out.push((key.to_string(), value.clone()));
+        }
+    }
+    out
+}
+
+fn server_object(value: &Value) -> Vec<(String, Value)> {
+    let map = match value.as_object() {
+        Some(map) => map,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for key in [
+        "enabled",
+        "url",
+        "agent_token",
+        "sync_interval_secs",
+        "insecure_tls",
+    ] {
         if let Some(value) = map.get(key) {
             out.push((key.to_string(), value.clone()));
         }

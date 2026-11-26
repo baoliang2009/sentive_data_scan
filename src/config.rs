@@ -197,7 +197,7 @@ impl Default for ServerSyncConfig {
             enabled: true,
             url: String::new(),
             agent_token: String::new(),
-            sync_interval_secs: 60,
+            sync_interval_secs: 15,
             insecure_tls: false,
         }
     }

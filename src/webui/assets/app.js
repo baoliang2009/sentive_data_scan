@@ -1409,6 +1409,45 @@
         )
       ]) +
 
+      section('服务端策略同步', '从服务端拉取统一扫描目录、定时扫描周期、白名单与检测规则，并接收远端删除指令', [
+        rowHtml(
+          '启用策略同步',
+          '开启后定时从服务端同步配置与指令',
+          switchHtml('server.enabled', !!(data.server && data.server.enabled))
+        ),
+        rowHtml(
+          '服务端地址',
+          '例如 https://10.0.0.5:8443；留空时若 syslog 开启 mDNS 则自动发现',
+          '<input class="input" style="width:280px" type="text" placeholder="https://10.0.0.5:8443" value="' +
+            attr((data.server && data.server.url) || '') +
+            '" data-setting="server.url">'
+        ),
+        rowHtml(
+          'Agent Token',
+          '与服务端 server.toml 中的 auth.agent_token 一致',
+          '<input class="input" style="width:280px" type="text" placeholder="填入共享 Agent Token" value="' +
+            attr((data.server && data.server.agent_token) || '') +
+            '" data-setting="server.agent_token">'
+        ),
+        rowHtml(
+          '同步间隔',
+          '多久拉取一次服务端策略（指令轮询 5~10 秒）',
+          '<input class="input narrow" type="number" min="5" value="' +
+            ((data.server && data.server.sync_interval_secs) || 15) +
+            '" data-setting="server.sync_interval_secs"> <span class="small muted">秒</span>'
+        ),
+        rowHtml(
+          '跳过自签 TLS 证书校验',
+          '服务端使用自签 HTTPS 证书时请开启此项',
+          switchHtml('server.insecure_tls', !!(data.server && data.server.insecure_tls))
+        ),
+        rowHtml(
+          '立即同步',
+          '马上向服务端拉取最新策略与远程指令，验证连通性',
+          '<button class="btn btn-sm" data-action="sync-server">立即同步策略</button>'
+        )
+      ]) +
+
       section('存储与隐私', '默认只保存脱敏值；数据库位于本机用户数据目录', [        rowHtml(
           '记录保留天数',
           '超期记录会在下次扫描时清理；0 表示永久保留',
@@ -2048,6 +2087,15 @@
           })
           .catch(function (error) {
             toast(error.message, { type: 'error' });
+          });
+        break;
+      case 'sync-server':
+        api('/api/server/sync', { method: 'POST', body: {} })
+          .then(function (result) {
+            toast('同步成功（版本 v' + result.revision + '，扫描目录 ' + (result.scan_roots || []).length + ' 个）');
+          })
+          .catch(function (error) {
+            toast(error.message, { type: 'error', duration: 6000 });
           });
         break;
       case 'test-syslog':

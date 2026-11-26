@@ -1336,7 +1336,12 @@
         if (state.filters.category) qParams.push('category=' + encodeURIComponent(state.filters.category));
         if (state.filters.severity) qParams.push('severity=' + encodeURIComponent(state.filters.severity));
         if (state.filters.q) qParams.push('q=' + encodeURIComponent(state.filters.q));
-        window.open('/api/events/export?' + qParams.join('&'), '_blank');
+        var link = document.createElement('a');
+        link.href = '/api/events/export?' + qParams.join('&');
+        link.download = '';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
         break;
       }
       case 'delete-event-file': {
@@ -1348,7 +1353,10 @@
           function () {
             api('/api/events/delete-file', { method: 'POST', body: { event_id: evId } })
               .then(function () {
-                toast('已下发删除指令，等待客户端同步执行');
+                toast('已下发删除指令，客户端将在数秒内执行');
+                setTimeout(function () {
+                  if (state.route === 'events') loadEvents().catch(function () {});
+                }, 8000);
               })
               .catch(showError);
           }
