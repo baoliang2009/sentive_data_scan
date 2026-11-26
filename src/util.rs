@@ -3,6 +3,55 @@ use std::path::Path;
 use chrono::{Local, TimeZone};
 use sha2::{Digest, Sha256};
 
+/// 读取一行（含末尾 `\n`），但**限制最大字节数**。
+///
+/// 这是避免「对端永不发换行导致无限缓冲」的关键：`BufRead::read_line` / `lines()`
+/// 会一直读到换行或 EOF 才返回，对端若持续发送不含 `\n` 的数据，缓冲区就会无上限增长，
+/// 最终把进程内存吃光（表现为内存/交换暴涨）。本函数一旦超过 `max` 立即返回错误。
+///
+/// 返回读取到的字节数；0 表示 EOF。`buf` 只包含本次读到的内容（已清空）。
+pub fn read_line_bounded<R: std::io::BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<usize> {
+    buf.clear();
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if available.is_empty() {
+            return Ok(buf.len());
+        }
+        // 本段里如果出现换行，只取到换行为止。
+        if let Some(position) = available.iter().position(|byte| *byte == b'\n') {
+            let take = position + 1;
+            if buf.len() + take > max {
+                return Err(too_long());
+            }
+            buf.extend_from_slice(&available[..take]);
+            reader.consume(take);
+            return Ok(buf.len());
+        }
+        // 整段都没有换行；若加上它会超限，立即报错而不是继续缓冲。
+        if buf.len() + available.len() > max {
+            return Err(too_long());
+        }
+        buf.extend_from_slice(available);
+        let consumed = available.len();
+        reader.consume(consumed);
+    }
+}
+
+fn too_long() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "单行长度超过上限（对端可能未发送换行符，已断开以防内存耗尽）",
+    )
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -251,5 +300,40 @@ mod tests {
         let end = start + "SuperSecret!".len();
         let snippet = build_snippet(text, start, end, "Supe********cret!", 80);
         assert!(!snippet.contains("SuperSecret!"));
+    }
+
+    #[test]
+    fn bounded_read_stops_at_limit() {
+        use std::io::BufReader;
+        // 无换行的无限流：必须在上限处报错，而不是无限缓冲。
+        let data = vec![b'A'; 100_000];
+        let mut reader = BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+        let result = read_line_bounded(&mut reader, &mut buf, 1024);
+        assert!(result.is_err(), "超过上限应报错");
+        assert!(buf.len() <= 1024, "缓冲区不得超过上限");
+
+        // 正常多行：逐行读取正确。
+        let text = b"line one\nline two\n";
+        let mut reader = BufReader::new(&text[..]);
+        let mut buf = Vec::new();
+        assert_eq!(read_line_bounded(&mut reader, &mut buf, 1024).unwrap(), 9);
+        assert_eq!(buf, b"line one\n");
+        assert_eq!(read_line_bounded(&mut reader, &mut buf, 1024).unwrap(), 9);
+        assert_eq!(buf, b"line two\n");
+        assert_eq!(read_line_bounded(&mut reader, &mut buf, 1024).unwrap(), 0);
+    }
+
+    #[test]
+    fn bounded_read_handles_exact_limit() {
+        use std::io::BufReader;
+        let text = b"abcde\n";
+        let mut reader = BufReader::new(&text[..]);
+        let mut buf = Vec::new();
+        // 恰好等于上限应成功。
+        assert_eq!(read_line_bounded(&mut reader, &mut buf, 6).unwrap(), 6);
+        // 上限小 1 应失败。
+        let mut reader = BufReader::new(&text[..]);
+        assert!(read_line_bounded(&mut reader, &mut buf, 5).is_err());
     }
 }

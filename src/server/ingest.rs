@@ -237,14 +237,17 @@ fn run_tcp(
         let store = Arc::clone(store);
         let stats = Arc::clone(stats);
         std::thread::spawn(move || {
-            use std::io::BufRead;
             let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
-            let reader = std::io::BufReader::new(stream);
-            for line in reader.lines() {
-                match line {
-                    Ok(line) => {
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line_bytes = Vec::new();
+            loop {
+                // 关键：用带长度上限的读行，防止对端只发数据不发换行时无限缓冲。
+                match crate::util::read_line_bounded(&mut reader, &mut line_bytes, max_bytes) {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {
                         stats.packets.fetch_add(1, Ordering::Relaxed);
-                        handle_line(&line, peer, &store, &stats);
+                        let line = String::from_utf8_lossy(&line_bytes);
+                        handle_line(line.trim_end_matches(['\r', '\n']), peer, &store, &stats);
                     }
                     Err(error) => {
                         tracing::debug!(error = %error, "TCP 读取失败，关闭连接");
@@ -252,9 +255,6 @@ fn run_tcp(
                     }
                 }
             }
-            // max_bytes 在 TCP 场景下由 BufReader 的分行行为隐式限制，
-            // 这里显式引用避免未使用告警，同时作为文档提示。
-            let _ = max_bytes;
         });
     }
     Ok(())

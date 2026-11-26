@@ -5,7 +5,7 @@
 //! does not need keep-alive, chunked encoding or TLS.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
@@ -113,13 +113,13 @@ fn index_html(ctx: &AppContext) -> String {
 fn read_request(stream: &mut TcpStream) -> Result<Option<Request>, String> {
     let mut reader = BufReader::new(stream.try_clone().map_err(|error| error.to_string())?);
 
-    let mut request_line = String::new();
-    let read = reader
-        .read_line(&mut request_line)
+    let mut line_bytes = Vec::new();
+    let read = crate::util::read_line_bounded(&mut reader, &mut line_bytes, MAX_HEADER_BYTES)
         .map_err(|error| format!("读取请求失败: {error}"))?;
     if read == 0 {
         return Ok(None);
     }
+    let request_line = String::from_utf8_lossy(&line_bytes);
     let request_line = request_line.trim_end();
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_ascii_uppercase();
@@ -135,9 +135,7 @@ fn read_request(stream: &mut TcpStream) -> Result<Option<Request>, String> {
     let mut headers: HashMap<String, String> = HashMap::new();
     let mut header_bytes = request_line.len();
     loop {
-        let mut line = String::new();
-        let read = reader
-            .read_line(&mut line)
+        let read = crate::util::read_line_bounded(&mut reader, &mut line_bytes, MAX_HEADER_BYTES)
             .map_err(|error| format!("读取请求头失败: {error}"))?;
         if read == 0 {
             break;
@@ -146,6 +144,7 @@ fn read_request(stream: &mut TcpStream) -> Result<Option<Request>, String> {
         if header_bytes > MAX_HEADER_BYTES {
             return Err("请求头过大".to_string());
         }
+        let line = String::from_utf8_lossy(&line_bytes);
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;

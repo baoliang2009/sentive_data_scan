@@ -665,11 +665,17 @@ impl SyslogServer {
                 .unwrap_or_else(|_| "unknown".to_string());
             let output = output.to_path_buf();
             std::thread::spawn(move || {
-                use std::io::BufRead;
-                let reader = std::io::BufReader::new(stream);
-                for line in reader.lines() {
-                    match line {
-                        Ok(line) => store_line(&output, &line, &peer),
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line_bytes = Vec::new();
+                // 用带长度上限的读行，避免对端不发换行导致无限缓冲。
+                const MAX_LINE: usize = 1024 * 1024;
+                loop {
+                    match crate::util::read_line_bounded(&mut reader, &mut line_bytes, MAX_LINE) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let line = String::from_utf8_lossy(&line_bytes);
+                            store_line(&output, line.trim_end_matches(['\r', '\n']), &peer);
+                        }
                         Err(error) => {
                             tracing::debug!(error = %error, "读取 TCP 报文失败");
                             break;
