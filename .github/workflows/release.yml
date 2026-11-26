@@ -21,14 +21,17 @@ jobs:
             target: x86_64-pc-windows-msvc
             bin: sentinel.exe
             asset: sentinel-windows-x86_64.exe
+            platform: windows-x86_64
           - os: macos-latest
             target: aarch64-apple-darwin
             bin: sentinel
             asset: sentinel-macos-aarch64
+            platform: macos-aarch64
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             bin: sentinel
             asset: sentinel-linux-x86_64
+            platform: linux-x86_64
 
     steps:
       - uses: actions/checkout@v4
@@ -42,23 +45,28 @@ jobs:
       - name: Build release
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Prepare asset
+      - name: Prepare assets
         shell: bash
         run: |
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+          # 服务端与客户端同源同版本，一并产出，避免用户还要自己编译。
+          case "${{ matrix.bin }}" in
+            sentinel.exe) cp "target/${{ matrix.target }}/release/sentinel-server.exe" "dist/sentinel-server-windows-x86_64.exe" ;;
+            *) cp "target/${{ matrix.target }}/release/sentinel-server" "dist/sentinel-server-${{ matrix.platform }}" ;;
+          esac
           ls -lh dist
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}
+          path: dist/*
           if-no-files-found: error
 
       - name: Publish GitHub release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/${{ matrix.asset }}
+          files: dist/*
           generate_release_notes: true

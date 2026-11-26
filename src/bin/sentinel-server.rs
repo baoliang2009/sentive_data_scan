@@ -3,6 +3,7 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use data_sentinel::server::{self, auth, config::ServerConfig};
 use tracing_subscriber::EnvFilter;
@@ -140,7 +141,36 @@ fn doctor(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         },
         config.ingest.bind
     );
-    println!("控制台：http://{}", config.server.bind);
+    println!(
+        "控制台：{}://{}",
+        if config.tls.cert.as_os_str().is_empty() {
+            "http"
+        } else {
+            "https"
+        },
+        config.server.bind
+    );
+    // 证书/私钥问题必须在启动前暴露，否则运维只会在浏览器里看到握手失败。
+    if config.tls.cert.as_os_str().is_empty() {
+        println!("TLS：未配置（明文 HTTP）");
+    } else {
+        server::tls::load(&config.tls.cert, &config.tls.key)
+            .with_context(|| "TLS 证书/私钥不可用")?;
+        println!("TLS：证书与私钥校验通过（{}）", config.tls.cert.display());
+    }
+    if config.discover.enabled {
+        let instance = if config.discover.instance.trim().is_empty() {
+            data_sentinel::mdns::default_instance_name()
+        } else {
+            config.discover.instance.trim().to_string()
+        };
+        println!(
+            "mDNS：广播 {}（实例 {}）",
+            config.discover.service, instance
+        );
+    } else {
+        println!("mDNS：未广播（客户端需手动配置地址）");
+    }
     println!("自检通过");
     Ok(())
 }

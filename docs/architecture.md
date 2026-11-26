@@ -102,10 +102,25 @@ data-sentinel/
 │   │   ├── mod.rs               # 回环监听、会话令牌、浏览器/文件管理器调用
 │   │   ├── server.rs            # 极简 HTTP/1.1 + 静态资源内嵌
 │   │   ├── api.rs               # JSON 接口：概览/命中/规则/扫描/设置
-│   │   ├── tomlpatch.rs         # 保留注释的 config.toml 就地改写
 │   │   └── assets/              # index.html + app.css + app.js（无构建步骤）
-│   └── util.rs                  # 路径、脱敏、哈希、HTML 转义
-└── tests/detection.rs
+│   ├── server/                  # 集中服务端（sentinel-server）
+│   │   ├── mod.rs               # 启动、凭据自举、mDNS 广播、保留期线程
+│   │   ├── config.rs            # server.toml（含 [tls] / [discover]）
+│   │   ├── http.rs              # HTTP/1.1 + TLS 终止（同端口复用路由）
+│   │   ├── tls.rs               # rustls + ring，加载 PEM 证书链与私钥
+│   │   ├── api.rs               # 控制台 API 与 Agent API
+│   │   ├── auth.rs              # PBKDF2 口令、会话表、定长比较
+│   │   ├── ingest.rs            # RFC 5424 / 裸 JSON 接收（UDP/TCP）
+│   │   ├── store.rs             # 服务端 SQLite（agents/events/...）
+│   │   ├── rules.rs             # 规则版本、发布/回滚/同步状态
+│   │   └── assets/              # 集中管理控制台前端
+│   ├── tomlpatch.rs             # 保留注释的 TOML 就地改写（客户端/服务端共用）
+│   └── util.rs                  # 路径、脱敏、哈希、有界读行、HTML 转义
+└── tests/
+    ├── detection.rs
+    ├── syslog_forward.rs
+    ├── server.rs                # TLS 握手 + mDNS 广播
+    └── fixtures/tls/            # 测试用自签证书（仅测试）
 ```
 
 模块之间只通过 `Config`、`Finding`、`Store` 等少量类型耦合，后续可替换检测引擎或再套一层原生壳而不影响核心。
@@ -481,6 +496,48 @@ mDNS 组播 224.0.0.251:5353  ──────►  browse → ServiceResolved
 
 诊断：`sentinel syslog discover [--service ...] [--timeout-ms ...]`，控制台设置页也提供「查找服务端」按钮（`POST /api/syslog/discover`）。
 
+`sentinel-server` 的广播在 TXT 里额外带 `console=<端口>` 与 `console_tls=1`，
+因此同一条发现结果也能直接给出控制台地址（`https://10.0.0.5:8443/`）。
+
+---
+
+## 9.2 集中服务端（`sentinel-server`）
+
+单个二进制完成三件事：接收上报、汇总展示、统一下发规则。
+
+```
+客户端 sentinel                    sentinel-server
+──────────────                     ───────────────
+scan/watch 命中
+   │ Forwarder（异步队列）
+   ▼
+syslog UDP/TCP  ────────────────►  ingest：RFC 5424 / 裸 JSON
+                                      │ 只保留脱敏值
+                                      ▼
+                                   SQLite：agents / events /
+                                           rule_sets / audit_log
+                                      │
+                                      ├─► Web 控制台（会话鉴权）
+                                      └─► /api/agent/rules（Bearer Token）
+                                             ▲
+客户端拉取规则并按 revision 自动应用 ─────────┘
+```
+
+| 关注点 | 设计 |
+|---|---|
+| 进程模型 | 与客户端一致的「阻塞 TCP + 每连接一线程」，不引入 async 运行时 |
+| 鉴权 | 控制台：PBKDF2 口令 + 内存会话（HttpOnly / SameSite=Strict）；Agent：共享 Token，定长比较 |
+| 防爆破 | 同一来源 5 次失败锁 5 分钟（内存计数） |
+| 规则安全 | 发布前强制编译正则与校验器；一条坏规则会让所有客户端扫描失效，因此宁可在服务端拒绝 |
+| 版本管理 | 整份文档按版本保存；回滚=把旧内容作为新版本发布，历史不可变 |
+| 隐私 | 服务端只存脱敏值，客户端误发的原文一律丢弃 |
+| 传输加密 | `[tls]` 配置即启用 HTTPS（rustls + ring，无 OpenSSL 依赖）；证书有问题直接启动失败，不静默降级 |
+| 零配置 | `[discover]` mDNS 广播 syslog 地址与控制台端口，客户端 `discovery = "mdns"` 即可上报 |
+| 保留期 | 启动时 + 每小时按 `retention.event_days` 清理 |
+
+服务端与客户端共用 `RulesConfig`、`Severity` 与 `RuleSet` 编译逻辑，
+所以「控制台里能保存的规则」与「客户端能跑的规则」不可能出现定义漂移。
+
 ---
 
 ## 10. 开机自启
@@ -508,6 +565,7 @@ mDNS 组播 224.0.0.251:5353  ──────►  browse → ServiceResolved
 - **已知限制**：用户态 watcher 在网络盘/部分 FUSE 文件系统上可能丢事件，依赖定时对账兜底；恶意软件可绕过；不替代专业 DLP。
 - **syslog 链路**：UDP/TCP 明文传输，跨不可信网络需自行加 TLS 代理或隧道；外发失败只记日志，不保证投递（如需可靠投递请用 TCP + 服务端 ACK 方案）。
 - **mDNS 暴露面**：广播内容仅含服务名、IP、端口、协议与版本，不含命中数据；但会把本机标注为"数据哨兵节点"，高保密环境应关闭 `advertise` 改用静态地址。mDNS 只在本广播域内有效，不跨路由。
+- **服务端传输**：控制台可用 `[tls]` 启用 HTTPS（rustls，无 OpenSSL 依赖）；syslog 上报链路仍是明文 UDP/TCP，跨不可信网段请配合防火墙、专网或隧道。
 
 ---
 

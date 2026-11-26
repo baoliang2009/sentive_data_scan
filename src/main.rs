@@ -205,6 +205,9 @@ fn handle_syslog(config: &Config, command: SyslogCommand) -> Result<()> {
                     if let Some(protocol) = &found.protocol {
                         println!("  协议：{protocol}（由服务端 TXT 声明）");
                     }
+                    if let Some(console) = &found.console {
+                        println!("  控制台：{console}");
+                    }
                     let addresses: Vec<String> = found
                         .addresses
                         .iter()

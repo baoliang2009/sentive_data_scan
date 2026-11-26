@@ -287,6 +287,16 @@ pub fn handle(request: &Request, state: &AppState, actor: &str) -> (u16, &'stati
             },
             "retention_days": state.config.retention.event_days,
             "tls": !state.config.tls.cert.as_os_str().is_empty(),
+            "discover": {
+                "enabled": state.config.discover.enabled,
+                "service": state.config.discover.service,
+                "instance": if state.config.discover.instance.trim().is_empty() {
+                    crate::mdns::default_instance_name()
+                } else {
+                    state.config.discover.instance.clone()
+                },
+            },
+            "console_bind": state.config.server.bind,
             "version": env!("CARGO_PKG_VERSION"),
         })),
 

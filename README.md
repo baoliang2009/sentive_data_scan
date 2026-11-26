@@ -15,6 +15,7 @@
 - **Office 抽取**：直接扫描 `.docx/.xlsx/.pptx` 内部文本。
 - **脱敏存储**：只保存 `110105********002X` 这类脱敏值、行号、上下文和哈希；支持 HTML/JSON 报告。
 - **本地控制台**：`sentinel ui` 启动图形界面（概览 / 命中记录 / 检测规则 / 设置），带实时扫描进度、筛选搜索、批量确认与报告导出；仅监听 `127.0.0.1`，三平台统一用系统浏览器打开。控制台进程默认自带落盘监控，文件落到扫描目录会立即检测并提醒（`--no-watch` 可关闭）。
+- **集中服务端**（可选）：`sentinel-server` 接收各终端上报的告警，按用户/类型/级别汇总，提供 Web 控制台统一维护下发检测规则；支持 HTTPS 与 mDNS 零配置发现。
 - **桌面通知**：Windows Toast、macOS 通知中心、Linux/Kylin `notify-send`，并有降级通道。
 - **开机自启**：Windows 任务计划/注册表、macOS LaunchAgent、Linux systemd 用户服务/XDG autostart。
 - **单文件可执行**：Rust 编译，无运行时依赖（SQLite 已内置）。
@@ -283,6 +284,17 @@ sentinel syslog discover --service _datasentinel._udp.local. --timeout-ms 8000
 >
 > 防火墙放行：Windows 首次运行勾选「专用网络」；Linux `firewall-cmd --add-service=mdns` 或 `ufw allow 5353/udp`。
 
+`sentinel-server` 启动时会广播，并在 TXT 里额外带 `console=<端口>` / `console_tls=1`，
+所以 `sentinel syslog discover` 能一次把 syslog 地址和**控制台地址**都列出来：
+
+```text
+发现 syslog 服务端：
+  实例：DataSentinel-srv01._datasentinel._udp.local.
+  地址：10.0.0.5:5514
+  协议：udp（由服务端 TXT 声明）
+  控制台：https://10.0.0.5:8443/
+```
+
 对接 rsyslog 的示例（服务端 `/etc/rsyslog.conf`）：
 
 ```
@@ -291,6 +303,78 @@ input(type="imudp" port="514")
 template(name="dsJson" type="string" string="%msg%\n")
 local4.* /var/log/datasentinel.log;dsJson
 ```
+
+## 服务端：集中接收与规则下发（`sentinel-server`）
+
+客户端上报的告警默认只留在本机。需要**集中视角**（谁、在哪台机器、命中了哪类敏感数据）时，
+部署 `sentinel-server`：它接收 syslog、按用户/类型/级别汇总，并提供 Web 控制台统一维护下发检测规则。
+
+```bash
+cargo build --release
+./target/release/sentinel-server run            # 首次启动自动生成配置、口令与 Agent Token
+./target/release/sentinel-server doctor         # 自检：数据库、规则、TLS 证书、mDNS
+./target/release/sentinel-server config-path     # 配置文件位置
+./target/release/sentinel-server agent-token    # 打印 Agent Token（配置客户端用）
+./target/release/sentinel-server password-hash '你的新口令'
+```
+
+首次启动会把生成的初始化口令**只打印一次**，并写入 `server.toml` 的 `auth.admin_password_hash`；
+`auth.agent_token` 留空时同样自动生成并写回。两者都是就地改写对应行，不会覆盖你写的注释。
+
+| 关注点 | 做法 |
+|---|---|
+| 采集 | syslog RFC 5424（UDP/TCP/两者），也接受裸 JSON 行；来源可用 `allow_cidrs` 限制 |
+| 存储 | 独立 SQLite（`server.db`），表结构含 agents / events / rule_sets / audit_log |
+| 隐私 | 服务端只存**脱敏值**；客户端即使误发原文也会被丢弃，避免服务端变成明文仓库 |
+| 鉴权 | 控制台走管理口令 + 会话 Cookie（HttpOnly/SameSite）；Agent 走共享 Bearer Token |
+| 规则 | 整份规则文档按版本保存，支持回滚（回滚生成新版本，历史不删）；发布前强制编译校验 |
+| 审计 | 规则发布/回滚、删除终端、清理告警等都写 `audit_log` |
+| 保留期 | 启动时与每小时按 `retention.event_days` 清理过期告警 |
+| 零配置 | `[discover]` 通过 mDNS 广播地址，客户端 `discovery = "mdns"` 即可上报 |
+| 传输安全 | `[tls]` 配好证书即启用 HTTPS，与明文共用同一端口，**不会**静默退化成明文 |
+
+### HTTPS
+
+`[tls]` 的 `cert` / `key` 必须同时配置，任一缺失或证书私钥不匹配都会让启动失败——
+安全配置“配了但没生效”比不配更危险，所以这里选择直接报错而不是降级。
+
+```bash
+# 生成自签证书（把 IP 换成服务端实际地址，客户端访问才不会报域名不匹配）
+openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+  -keyout server.key -out server.crt \
+  -subj "/CN=sentinel.local" \
+  -addext "subjectAltName=DNS:sentinel.local,IP=10.0.0.5" \
+  -addext "basicConstraints=critical,CA:FALSE" \
+  -addext "extendedKeyUsage=serverAuth"
+```
+
+TLS 实现用 `rustls` + `ring`（纯 Rust，**不依赖 OpenSSL 运行库**），因此 Windows / 麒麟 / macOS
+的产物依旧是单文件可执行。
+
+启动后用 `doctor` 或控制台「服务设置 → 接入地址」确认当前是 `http://` 还是 `https://`。
+
+### mDNS 广播
+
+```toml
+[discover]
+enabled = true
+service = "_datasentinel._udp.local."   # 必须与客户端 [syslog] mdns_service 一致
+instance = ""                           # 空 = DataSentinel-<主机名>
+```
+
+广播内容只有服务名、IP、端口、协议、版本与控制台端口，**不含任何告警数据**。
+高保密环境应设 `enabled = false`，改用静态地址。
+
+客户端侧无需任何 IP：
+
+```toml
+[syslog]
+enabled = true
+discovery = "mdns"
+mdns_service = "_datasentinel._udp.local."
+```
+
+部署细节（systemd、最低权限、防火墙、证书）见 [`docs/server-deploy.md`](docs/server-deploy.md)。
 
 ## 平台说明
 
@@ -375,19 +459,22 @@ powershell -ExecutionPolicy Bypass -File .\build-windows.ps1
 cargo test
 ```
 
-覆盖：身份证校验位/行政区划、银行卡 BIN + Luhn、手机号号段、座机区号、社保卡号标签联动、占位符、编码识别、分块边界、规则引擎、SQLite 去重/确认状态、syslog 外发（脱敏、去重、UDP/TCP、mDNS 自动发现与回落），以及时间戳/订单号/雪花 ID 等常见数字噪声的误报回归。
+覆盖：身份证校验位/行政区划、银行卡 BIN + Luhn、手机号号段、座机区号、社保卡号标签联动、占位符、编码识别、分块边界、规则引擎、SQLite 去重/确认状态、syslog 外发（脱敏、去重、UDP/TCP、mDNS 自动发现与回落）、服务端 HTTPS 握手与证书校验、mDNS 广播带出控制台地址，以及时间戳/订单号/雪花 ID 等常见数字噪声的误报回归。
 
 ## 目录结构
 
 ```
 src/
   main.rs        CLI 分发、日志
+  bin/
+    sentinel-server.rs  服务端入口
   cli.rs         clap 定义
   config.rs      配置与常用目录探测
   model.rs       Finding / 统计模型
   rules/         规则集、内置规则、本地区划/卡 BIN 常量表、校验器
   syslog.rs      RFC 5424 外发、异步队列、接收端
   mdns.rs        mDNS/DNS-SD 自动发现与广播
+  server/        集中服务端：HTTP/TLS、接收、存储、规则下发、控制台
   detect.rs      编码、二进制嗅探、Office 抽取
   scan.rs        遍历、并行、增量台账
   watch.rs       notify 监听与去抖
@@ -395,8 +482,10 @@ src/
   notify.rs      三平台桌面通知
   autostart.rs   三平台自启
   report.rs      HTML/JSON 报告
-  util.rs        脱敏、哈希、片段、转义
-tests/           集成测试
+  tomlpatch.rs   保留注释的 TOML 就地改写
+  util.rs        脱敏、哈希、片段、有界读行、转义
+tests/           集成测试（含 TLS 测试证书）
+config/          客户端与服务端默认配置
 docs/            架构设计
 ```
 

@@ -22,6 +22,7 @@ pub struct ServerConfig {
     pub auth: AuthConfig,
     pub retention: RetentionConfig,
     pub tls: TlsConfig,
+    pub discover: DiscoverConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +137,28 @@ impl Default for TlsConfig {
     }
 }
 
+/// mDNS 广播：让客户端 `discovery = "mdns"` 零配置找到本服务端。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiscoverConfig {
+    /// 是否广播；保密环境应关闭后改用静态地址。
+    pub enabled: bool,
+    /// 广播的服务类型；必须与客户端 `syslog.mdns_service` 一致。
+    pub service: String,
+    /// 实例名；空则用 `DataSentinel-<hostname>`。
+    pub instance: String,
+}
+
+impl Default for DiscoverConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            service: crate::config::DEFAULT_MDNS_SERVICE.to_string(),
+            instance: String::new(),
+        }
+    }
+}
+
 impl ServerConfig {
     pub fn load(explicit: Option<&Path>) -> Result<(Self, PathBuf)> {
         let path = resolve_server_config_path(explicit);
@@ -158,19 +181,11 @@ impl ServerConfig {
                 self.server.bind
             );
         }
-        if self.ingest.enabled {
-            if !has_host_port(&self.ingest.bind) {
-                bail!(
-                    "ingest.bind 需为 host:port 形式，例如 0.0.0.0:5514（当前：{}）",
-                    self.ingest.bind
-                );
-            }
-            if !matches!(
-                self.ingest.protocol.to_ascii_lowercase().as_str(),
-                "udp" | "tcp" | "both"
-            ) {
-                bail!("ingest.protocol 只支持 udp / tcp / both");
-            }
+        if self.ingest.enabled && !has_host_port(&self.ingest.bind) {
+            bail!(
+                "ingest.bind 需为 host:port 形式，例如 0.0.0.0:5514（当前：{}）",
+                self.ingest.bind
+            );
         }
         if !matches!(
             self.ingest.protocol.to_ascii_lowercase().as_str(),
@@ -183,6 +198,12 @@ impl ServerConfig {
         }
         if !self.tls.cert.as_os_str().is_empty() != !self.tls.key.as_os_str().is_empty() {
             bail!("tls.cert 与 tls.key 必须同时配置或同时留空");
+        }
+        if self.discover.enabled && !crate::config::is_valid_mdns_service(&self.discover.service) {
+            bail!(
+                "discover.service 需形如 _datasentinel._udp.local.（服务名 ≤15 字节），当前：{}",
+                self.discover.service
+            );
         }
         if self.auth.session_ttl_minutes == 0 {
             bail!("auth.session_ttl_minutes 必须大于 0");
@@ -347,5 +368,16 @@ mod tests {
         assert_eq!(config.listen_protocols(), vec!["udp", "tcp"]);
         config.ingest.protocol = "tcp".to_string();
         assert_eq!(config.listen_protocols(), vec!["tcp"]);
+    }
+
+    #[test]
+    fn validates_mdns_service_name() {
+        let mut config = ServerConfig::default();
+        assert!(config.validate().is_ok());
+        config.discover.service = "_a-very-long-service-name._udp.local.".to_string();
+        assert!(config.validate().is_err());
+        // 关闭广播时不再校验服务名（不广播就无所谓）
+        config.discover.enabled = false;
+        assert!(config.validate().is_ok());
     }
 }

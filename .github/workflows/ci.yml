@@ -33,19 +33,25 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sentinel-windows-x86_64
-          path: target/release/sentinel.exe
+          path: |
+            target/release/sentinel.exe
+            target/release/sentinel-server.exe
           if-no-files-found: error
       - name: Upload macOS binary
         if: matrix.os == 'macos-latest'
         uses: actions/upload-artifact@v4
         with:
           name: sentinel-macos-${{ runner.arch }}
-          path: target/release/sentinel
+          path: |
+            target/release/sentinel
+            target/release/sentinel-server
           if-no-files-found: error
       - name: Upload Linux binary
         if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v4
         with:
           name: sentinel-linux-x86_64
-          path: target/release/sentinel
+          path: |
+            target/release/sentinel
+            target/release/sentinel-server
           if-no-files-found: error

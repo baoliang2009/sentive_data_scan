@@ -32,6 +32,9 @@ pub struct DiscoveredServer {
     pub instance: String,
     /// 解析到的所有地址，IPv4 优先。
     pub addresses: Vec<IpAddr>,
+    /// 控制台地址（服务端在 TXT 里声明 `console=<端口>` 时才有），
+    /// 例如 `https://10.0.0.5:8443`。仅用于提示运维人员，客户端不依赖它。
+    pub console: Option<String>,
 }
 
 impl DiscoveredServer {
@@ -144,6 +147,20 @@ impl Advertiser {
     /// 广播的地址会自动取本机所有非回环 IPv4/IPv6；`0.0.0.0` 会被展开成真实地址，
     /// 否则客户端拿到 `0.0.0.0` 无法连接。
     pub fn start(service: &str, instance: &str, bind: &str, protocol: &str) -> Result<Self> {
+        Self::start_with(service, instance, bind, protocol, &HashMap::new())
+    }
+
+    /// 同 [`start`](Self::start)，但可以附加自定义 TXT 键值。
+    ///
+    /// `sentinel-server` 用它额外广播 `console=<端口>` / `console_tls=1`，
+    /// 这样运维在 `sentinel syslog discover` 里就能直接看到控制台地址。
+    pub fn start_with(
+        service: &str,
+        instance: &str,
+        bind: &str,
+        protocol: &str,
+        extra: &HashMap<String, String>,
+    ) -> Result<Self> {
         let service = normalize_service(service);
         let port = bind
             .rsplit_once(':')
@@ -153,11 +170,18 @@ impl Advertiser {
         let host_name = format!("{host}.local.");
 
         let daemon = ServiceDaemon::new().context("无法启动 mDNS 服务端")?;
-        let properties = HashMap::from([
+        let mut props = HashMap::from([
             ("protocol".to_string(), protocol.to_string()),
             ("ver".to_string(), env!("CARGO_PKG_VERSION").to_string()),
             ("app".to_string(), "DataSentinel".to_string()),
         ]);
+        // 调用方的键覆盖内置键，避免顺序依赖。
+        for (key, value) in extra {
+            if !key.trim().is_empty() {
+                props.insert(key.trim().to_string(), value.clone());
+            }
+        }
+        let properties = props;
         let mut info = ServiceInfo::new(
             &service, instance, &host_name,
             // 空地址 + addr_auto：由库在注册时填入本机所有可用地址。
@@ -227,11 +251,28 @@ fn from_service_info(info: &mdns_sd::ResolvedService) -> Option<DiscoveredServer
         .get_property_val_str("protocol")
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| matches!(value.as_str(), "udp" | "tcp"));
+    // 控制台端口由服务端在 TXT 中声明；缺省表示该实例不提供控制台。
+    let console = info
+        .get_property_val_str("console")
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .map(|port| {
+            let tls = info
+                .get_property_val_str("console_tls")
+                .map(|value| value.trim() == "1" || value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let scheme = if tls { "https" } else { "http" };
+            match chosen {
+                IpAddr::V4(addr) => format!("{scheme}://{addr}:{port}/"),
+                IpAddr::V6(addr) => format!("{scheme}://[{addr}]:{port}/"),
+            }
+        });
     Some(DiscoveredServer {
         endpoint,
         protocol,
         instance: info.get_fullname().to_string(),
         addresses: candidates,
+        console,
     })
 }
 

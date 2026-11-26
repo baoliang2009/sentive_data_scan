@@ -4,7 +4,7 @@
 //! 离线麒麟机器上直接跑，不想为单个控制台引入 hyper/axum 整套异步栈。
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,28 +72,73 @@ impl Request {
 
 pub type Response = (u16, &'static str, Vec<u8>);
 
+/// 明文连接入口（`[tls]` 未配置时使用）。
 pub fn handle_connection(mut stream: TcpStream, state: Arc<AppState>) {
+    configure_socket(&stream);
+    let remote = peer_label(&stream);
+    serve(&mut stream, &state, remote);
+}
+
+/// HTTPS 连接入口：先完成 TLS 握手，再复用同一套请求解析与路由。
+///
+/// 握手失败只记 debug 日志并断开：公网扫描器经常直接打明文 HTTP 到 HTTPS 端口，
+/// 每次失败都刷一条 warn 会把正常日志淹没。
+pub fn handle_tls_connection(
+    stream: TcpStream,
+    state: Arc<AppState>,
+    tls: Arc<rustls::ServerConfig>,
+) {
+    configure_socket(&stream);
+    let remote = peer_label(&stream);
+    let conn = match rustls::ServerConnection::new(tls) {
+        Ok(conn) => conn,
+        Err(error) => {
+            tracing::warn!(error = %error, "初始化 TLS 会话失败");
+            return;
+        }
+    };
+    let mut tls_stream = rustls::StreamOwned::new(conn, stream);
+    if let Err(error) = tls_stream.conn.complete_io(&mut tls_stream.sock) {
+        tracing::debug!(error = %error, "TLS 握手失败（可能对端发送了明文 HTTP）");
+        return;
+    }
+    serve(&mut tls_stream, &state, remote);
+    // 显式发 close_notify：否则严格的 TLS 客户端会把“连接被直接断开”
+    // 记为 UnexpectedEof，curl/浏览器通常容忍但日志会很吵。
+    tls_stream.conn.send_close_notify();
+    let _ = tls_stream.flush();
+}
+
+fn configure_socket(stream: &TcpStream) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
     let _ = stream.set_nodelay(true);
+}
 
-    let remote = stream
+fn peer_label(stream: &TcpStream) -> String {
+    stream
         .peer_addr()
         .map(|addr| addr.ip().to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
+        .unwrap_or_else(|_| "unknown".to_string())
+}
 
-    let request = match read_request(&mut stream, remote) {
+/// 与传输层无关的主流程：读请求 → 路由 → 写响应。
+///
+/// 明文 `TcpStream` 与 `rustls::StreamOwned` 都满足 `Read + Write`，
+/// 因此路由、鉴权、Cookie 逻辑只写一份。
+fn serve<S: Read + Write>(stream: &mut S, state: &AppState, remote: String) {
+    let request = match read_request(stream, remote) {
         Ok(Some(request)) => request,
         Ok(None) => return,
         Err(error) => {
             let (status, ctype, body) = api::error_response(400, error);
-            respond(&mut stream, status, ctype, &body, &[]);
+            respond(stream, status, ctype, &body, &[]);
             return;
         }
     };
 
-    let (status, ctype, body, cookies) = route(&request, &state);
-    respond(&mut stream, status, ctype, &body, &cookies);
+    let (status, ctype, body, cookies) = route(&request, state);
+    respond(stream, status, ctype, &body, &cookies);
 }
 
 fn route(request: &Request, state: &AppState) -> (u16, &'static str, Vec<u8>, Vec<String>) {
@@ -155,16 +200,16 @@ fn index_html() -> String {
         .replace("__PLATFORM__", &crate::webui::platform_label())
 }
 
-fn read_request(stream: &mut TcpStream, remote: String) -> Result<Option<Request>, String> {
-    let mut reader = BufReader::new(stream.try_clone().map_err(|error| error.to_string())?);
+fn read_request<S: Read>(stream: &mut S, remote: String) -> Result<Option<Request>, String> {
+    let mut reader = BufReader::new(stream);
 
-    let mut request_line = String::new();
-    let read = reader
-        .read_line(&mut request_line)
+    let mut line_bytes = Vec::new();
+    let read = crate::util::read_line_bounded(&mut reader, &mut line_bytes, MAX_HEADER_BYTES)
         .map_err(|error| format!("读取请求失败: {error}"))?;
     if read == 0 {
         return Ok(None);
     }
+    let request_line = String::from_utf8_lossy(&line_bytes);
     let request_line = request_line.trim_end();
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_ascii_uppercase();
@@ -180,9 +225,7 @@ fn read_request(stream: &mut TcpStream, remote: String) -> Result<Option<Request
     let mut headers: HashMap<String, String> = HashMap::new();
     let mut header_bytes = request_line.len();
     loop {
-        let mut line = String::new();
-        let read = reader
-            .read_line(&mut line)
+        let read = crate::util::read_line_bounded(&mut reader, &mut line_bytes, MAX_HEADER_BYTES)
             .map_err(|error| format!("读取请求头失败: {error}"))?;
         if read == 0 {
             break;
@@ -191,6 +234,7 @@ fn read_request(stream: &mut TcpStream, remote: String) -> Result<Option<Request
         if header_bytes > MAX_HEADER_BYTES {
             return Err("请求头过大".to_string());
         }
+        let line = String::from_utf8_lossy(&line_bytes);
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;
@@ -224,8 +268,8 @@ fn read_request(stream: &mut TcpStream, remote: String) -> Result<Option<Request
     }))
 }
 
-fn respond(
-    stream: &mut TcpStream,
+fn respond<S: Write>(
+    stream: &mut S,
     status: u16,
     content_type: &str,
     body: &[u8],

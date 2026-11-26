@@ -49,5 +49,26 @@ event_days = 180
 
 [tls]
 # 配置后启用 HTTPS（PEM 格式）。两者需同时填写。
+# 生成自签证书示例：
+#   openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+#     -keyout server.key -out server.crt \
+#     -subj "/CN=sentinel.local" \
+#     -addext "subjectAltName=DNS:sentinel.local,IP:10.0.0.5" \
+#     -addext "basicConstraints=critical,CA:FALSE" \
+#     -addext "extendedKeyUsage=serverAuth"
+# 若要在浏览器里不报警告，请把 server.crt 导入客户端受信任根证书。
 cert = ""
 key = ""
+
+[discover]
+# 通过 mDNS/DNS-SD 广播本服务端，客户端设 [syslog] discovery = "mdns"
+# 即可零配置上报，无需手填 IP。
+# 广播内容只有服务名、IP、端口、协议、版本与控制台端口，不含任何告警数据；
+# 高保密环境请设为 false，改用静态地址。
+enabled = true
+
+# 广播的服务类型，必须与客户端 [syslog] mdns_service 完全一致。
+service = "_datasentinel._udp.local."
+
+# 实例名；空则使用 DataSentinel-<主机名>，同网段多台服务端靠它区分。
+instance = ""

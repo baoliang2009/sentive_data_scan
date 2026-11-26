@@ -12,6 +12,7 @@ pub mod http;
 pub mod ingest;
 pub mod rules;
 pub mod store;
+pub mod tls;
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -86,7 +87,12 @@ pub fn run(config_path: Option<PathBuf>) -> Result<()> {
     println!("数据哨兵服务端已启动");
     println!("  配置文件：{}", path.display());
     println!("  数据库：{}", config.database_path().display());
-    println!("  控制台：http://{}/", config.server.bind);
+    let scheme = if config.tls.cert.as_os_str().is_empty() {
+        "http"
+    } else {
+        "https"
+    };
+    println!("  控制台：{scheme}://{}/", config.server.bind);
     if config.ingest.enabled {
         println!(
             "  syslog 接收：{} ({})",
@@ -119,11 +125,33 @@ pub fn run(config_path: Option<PathBuf>) -> Result<()> {
     }
 
     let config = Arc::new(config);
+
+    // 先加载 TLS、绑定控制台端口、再起 syslog 与 mDNS 广播。
+    // 顺序很重要：证书有问题或端口被占用时应当直接失败退出，
+    // 而不是先在后台拉起接收器与广播，留下一个“半启动”状态。
+    let tls = if config.tls.cert.as_os_str().is_empty() {
+        None
+    } else {
+        Some(tls::load(&config.tls.cert, &config.tls.key)?)
+    };
+    let listener = TcpListener::bind(&config.server.bind)
+        .with_context(|| format!("无法监听 {}", config.server.bind))?;
+    if tls.is_some() {
+        println!(
+            "  控制台已启用 HTTPS（证书：{}）",
+            config.tls.cert.display()
+        );
+    }
+
     let stats = if config.ingest.enabled {
         ingest::spawn(&config, Arc::clone(&store))?
     } else {
         Arc::new(ingest::IngestStats::default())
     };
+
+    // mDNS 广播：让客户端 discovery = "mdns" 直接找到本机。
+    // 放在 syslog 接收器启动之后，客户端拿到的地址就一定是可连的。
+    let _advertiser = start_advertiser(&config);
 
     let state = Arc::new(AppState {
         config: Arc::clone(&config),
@@ -137,18 +165,74 @@ pub fn run(config_path: Option<PathBuf>) -> Result<()> {
 
     start_retention_worker(Arc::clone(&state));
 
-    let listener = TcpListener::bind(&config.server.bind)
-        .with_context(|| format!("无法监听 {}", config.server.bind))?;
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
                 let state = Arc::clone(&state);
-                std::thread::spawn(move || http::handle_connection(stream, state));
+                let tls = tls.clone();
+                std::thread::spawn(move || match tls {
+                    Some(tls) => http::handle_tls_connection(stream, state, tls),
+                    None => http::handle_connection(stream, state),
+                });
             }
             Err(error) => tracing::debug!(error = %error, "接受连接失败"),
         }
     }
     Ok(())
+}
+
+/// 按配置注册 mDNS 广播，失败只告警——发现是便利功能，不能阻断服务启动。
+fn start_advertiser(config: &ServerConfig) -> Option<crate::mdns::Advertiser> {
+    if !config.discover.enabled {
+        tracing::info!("discover.enabled = false，客户端需手动填写服务端地址");
+        return None;
+    }
+    if !config.ingest.enabled {
+        // 广播的核心是 syslog 接收地址；没开接收就没有可广播的端口，
+        // 播出去只会让客户端连到一个空端口。
+        tracing::info!("ingest.enabled = false，跳过 mDNS 广播");
+        return None;
+    }
+    let instance = if config.discover.instance.trim().is_empty() {
+        crate::mdns::default_instance_name()
+    } else {
+        config.discover.instance.trim().to_string()
+    };
+
+    // 广播 syslog 监听地址，并附带控制台端口，便于 `syslog discover` 一并展示。
+    let console_port = config
+        .server
+        .bind
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok());
+    let mut extra = std::collections::HashMap::new();
+    if let Some(port) = console_port {
+        extra.insert("console".to_string(), port.to_string());
+        if !config.tls.cert.as_os_str().is_empty() {
+            extra.insert("console_tls".to_string(), "1".to_string());
+        }
+    }
+
+    match crate::mdns::Advertiser::start_with(
+        &config.discover.service,
+        &instance,
+        &config.ingest.bind,
+        &config.ingest.protocol,
+        &extra,
+    ) {
+        Ok(advertiser) => {
+            println!(
+                "  mDNS 广播：{}（客户端 discovery = \"mdns\" 即可自动发现）",
+                advertiser.fullname()
+            );
+            Some(advertiser)
+        }
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "mDNS 广播失败，客户端需手动配置地址");
+            println!("  mDNS 广播失败（不影响服务端运行）：{error:#}");
+            None
+        }
+    }
 }
 
 /// 确定三种凭据：管理口令哈希、明文口令（仅首次）、Agent Token。

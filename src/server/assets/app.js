@@ -1007,7 +1007,34 @@
       (config.retention_days || 0) +
       ' 天</div><div class="stat-hint">0 表示永久保留</div></div>' +
       '</div></section>' +
-      '<section class="card"><div class="card-head"><div><h2>客户端接入方式</h2></div></div>' +
+      '<section class="card"><div class="card-head"><div><h2>接入地址</h2>' +
+      '<div class="small muted" style="margin-top:2px">客户端两种接入方式：mDNS 自动发现，或手填静态地址</div></div></div>' +
+      '<div class="stat-grid">' +
+      '<div class="stat-card"><div class="stat-label">控制台</div>' +
+      '<div class="cell-mono" style="margin-top:6px">' +
+      esc((config.tls ? 'https://' : 'http://') + (location.host || config.console_bind || '—')) +
+      '</div><div class="stat-hint">' +
+      (config.tls ? '已启用 HTTPS' : '明文 HTTP（建议配置 [tls]）') +
+      ' · 监听 ' +
+      esc(config.console_bind || '—') +
+      '</div></div>' +
+      '<div class="stat-card"><div class="stat-label">mDNS 广播</div>' +
+      '<div class="stat-value" style="font-size:18px">' +
+      (config.discover && config.discover.enabled
+        ? (ingest.enabled ? '已启用' : '已跳过')
+        : '已关闭') +
+      '</div><div class="stat-hint">' +
+      (config.discover && config.discover.enabled && !ingest.enabled
+        ? 'syslog 接收已关闭，无地址可广播'
+        : esc((config.discover && config.discover.service) || '—')) +
+      '</div></div>' +
+      '<div class="stat-card"><div class="stat-label">广播实例名</div>' +
+      '<div class="cell-mono" style="margin-top:6px">' +
+      esc((config.discover && config.discover.instance) || '—') +
+      '</div></div>' +
+      '</div></section>' +
+      '<section class="card"><div class="card-head"><div><h2>客户端接入方式</h2>' +
+      '<div class="small muted" style="margin-top:2px">发现本服务端：sentinel syslog discover</div></div></div>' +
       '<div style="padding:16px"><div class="rule-pattern">' +
       esc(
         '[syslog]\nenabled = true\ndiscovery = "mdns"   # 或填 discovery = "static" 并指定 server\nserver = "<本服务端地址>:5514"'
