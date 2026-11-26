@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -150,6 +150,18 @@ impl Store {
     }
 
     pub fn file_states(&self) -> Result<HashMap<String, FileState>> {
+        self.file_states_within(None)
+    }
+
+    /// 读取扫描台账，`within` 为 `Some` 时只保留这些目录下的记录。
+    ///
+    /// 全量 `SELECT ... FROM files` 在几十万～上百万文件时会一次性占用
+    /// 上百 MB；扫描通常只覆盖配置中的几个根目录，按根前缀过滤可以让
+    /// 常驻内存只与本次扫描范围相关。
+    pub fn file_states_within(
+        &self,
+        within: Option<&[PathBuf]>,
+    ) -> Result<HashMap<String, FileState>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare("SELECT path, size, mtime FROM files")?;
         let rows = stmt.query_map([], |row| {
@@ -162,8 +174,27 @@ impl Store {
             ))
         })?;
         let mut states = HashMap::new();
+        // 预先把根目录转成“带分隔符的前缀”，避免每个文件都重新拼一次字符串。
+        let prefixes: Option<Vec<String>> = within.map(|roots| {
+            roots
+                .iter()
+                .map(|root| {
+                    let mut prefix = path_to_key(root);
+                    if !prefix.ends_with(std::path::MAIN_SEPARATOR) {
+                        prefix.push(std::path::MAIN_SEPARATOR);
+                    }
+                    prefix
+                })
+                .collect()
+        });
         for row in rows {
             let (path, state) = row?;
+            if let Some(prefixes) = &prefixes {
+                let matches = prefixes.iter().any(|prefix| path.starts_with(prefix));
+                if !matches {
+                    continue;
+                }
+            }
             states.insert(path, state);
         }
         Ok(states)

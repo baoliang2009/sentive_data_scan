@@ -380,11 +380,27 @@ pub fn default_instance_name() -> String {
 }
 
 /// 进程级单例：扫描路径上只能有一个缓存，否则每个 Scanner 都会各自发查询。
-static GLOBAL: OnceLock<Resolver> = OnceLock::new();
+static GLOBAL: OnceLock<Mutex<HashMap<String, &'static Resolver>>> = OnceLock::new();
 
-/// 取得全局 Resolver；首次调用时按配置初始化。
+/// 取得全局 Resolver；按 `(service, timeout)` 缓存。
+///
+/// 早期实现只 `get_or_init` 一个实例，后续调用的 `service` / `timeout`
+/// 参数会被静默忽略：运行期改配置、或多个 Scanner 用不同服务类型时，
+/// 实际仍在用第一次的配置，排查时非常容易误判。
 pub fn global_resolver(service: &str, timeout: Duration) -> &'static Resolver {
-    GLOBAL.get_or_init(|| Resolver::new(service, timeout))
+    let key = format!("{}|{}ms", normalize_service(service), timeout.as_millis());
+    let registry = GLOBAL.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = match registry.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(existing) = guard.get(&key) {
+        return existing;
+    }
+    // 进程生命周期内共享；泄漏一个 Resolver 是可接受的（每个 key 只发生一次）。
+    let resolver: &'static Resolver = Box::leak(Box::new(Resolver::new(service, timeout)));
+    guard.insert(key, resolver);
+    resolver
 }
 
 #[cfg(test)]

@@ -178,6 +178,10 @@ pub fn spawn(config: &ServerConfig, store: Arc<ServerStore>) -> Result<Arc<Inges
     Ok(stats)
 }
 
+/// 接收器并发连接上限：每个 TCP 连接一个线程，不设上限会被连接风暴打穿。
+static CONNECTION_LIMITER: crate::util::ConnectionLimiter =
+    crate::util::ConnectionLimiter::new(256);
+
 fn run_udp(
     bind: &str,
     max_bytes: usize,
@@ -203,6 +207,8 @@ fn run_udp(
             }
             Err(error) => {
                 tracing::debug!(error = %error, "UDP 接收失败");
+                // 持续错误（例如 FD 耗尽）时不能忙等自旋。
+                crate::util::backoff_after_accept_error(&error);
             }
         }
     }
@@ -223,6 +229,7 @@ fn run_tcp(
             Ok(stream) => stream,
             Err(error) => {
                 tracing::debug!(error = %error, "TCP accept 失败");
+                crate::util::backoff_after_accept_error(&error);
                 continue;
             }
         };
@@ -234,28 +241,46 @@ fn run_tcp(
             tracing::debug!(%peer, "来源不在白名单，已断开");
             continue;
         }
+        let Some(slot) = CONNECTION_LIMITER.try_acquire() else {
+            stats.rejected.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                %peer,
+                max = CONNECTION_LIMITER.max(),
+                "syslog 并发连接已达上限，已断开"
+            );
+            drop(stream);
+            continue;
+        };
         let store = Arc::clone(store);
         let stats = Arc::clone(stats);
-        std::thread::spawn(move || {
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
-            let mut reader = std::io::BufReader::new(stream);
-            let mut line_bytes = Vec::new();
-            loop {
-                // 关键：用带长度上限的读行，防止对端只发数据不发换行时无限缓冲。
-                match crate::util::read_line_bounded(&mut reader, &mut line_bytes, max_bytes) {
-                    Ok(0) => break, // EOF
-                    Ok(_) => {
-                        stats.packets.fetch_add(1, Ordering::Relaxed);
-                        let line = String::from_utf8_lossy(&line_bytes);
-                        handle_line(line.trim_end_matches(['\r', '\n']), peer, &store, &stats);
-                    }
-                    Err(error) => {
-                        tracing::debug!(error = %error, "TCP 读取失败，关闭连接");
-                        break;
+        let spawned = std::thread::Builder::new()
+            .name("sentinel-ingest-conn".into())
+            .spawn(move || {
+                let _slot = slot;
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line_bytes = Vec::new();
+                loop {
+                    // 关键：用带长度上限的读行，防止对端只发数据不发换行时无限缓冲。
+                    match crate::util::read_line_bounded(&mut reader, &mut line_bytes, max_bytes) {
+                        Ok(0) => break, // EOF
+                        Ok(_) => {
+                            stats.packets.fetch_add(1, Ordering::Relaxed);
+                            let line = String::from_utf8_lossy(&line_bytes);
+                            handle_line(line.trim_end_matches(['\r', '\n']), peer, &store, &stats);
+                        }
+                        Err(error) => {
+                            tracing::debug!(error = %error, "TCP 读取失败，关闭连接");
+                            break;
+                        }
                     }
                 }
-            }
-        });
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(error = %error, "无法为 syslog 连接创建处理线程");
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
     Ok(())
 }

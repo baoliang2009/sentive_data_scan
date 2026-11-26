@@ -81,9 +81,6 @@ fn run(cli: Cli) -> Result<()> {
             let roots = resolve_scan_roots(&config, &args);
             let summary = scanner.scan_roots(&roots, args.force);
             print_summary(&summary, args.json)?;
-            if !args.no_notify {
-                Notifier::new(&config.notify).notify_scan(&summary);
-            }
             // 短命进程：等外发队列排空再退出，避免刚启动就丢报文。
             scanner.flush_syslog();
             Ok(())
@@ -500,7 +497,9 @@ fn init_logging(config: &Config, verbose: bool) -> Option<WorkerGuard> {
 
     match config::ensure_private_dir(&config.logs_dir()) {
         Ok(()) => {
-            let appender = tracing_appender::rolling::daily(config.logs_dir(), "sentinel.log");
+            let logs_dir = config.logs_dir();
+            config::prune_old_logs(&logs_dir, config::LOG_RETENTION_DAYS);
+            let appender = tracing_appender::rolling::daily(logs_dir, "sentinel.log");
             let (writer, guard) = tracing_appender::non_blocking(appender);
             tracing_subscriber::registry()
                 .with(filter)

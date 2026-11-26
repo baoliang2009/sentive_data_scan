@@ -25,9 +25,15 @@ use anyhow::{Context, Result};
 
 use crate::config::Config;
 use crate::scan::ScanProgress;
-use crate::util::{now_ts, sha256_hex_str};
+use crate::util::{now_ts, sha256_hex_str, ConnectionLimiter};
 
 pub const DEFAULT_PORT: u16 = 7419;
+
+/// 本地控制台同时处理的连接数上限。
+///
+/// 单用户控制台不需要高并发；但每连接一线程且没有上限时，浏览器里一个死循环
+/// 的脚本（或本机的恶意进程）就能把线程栈/FD 打满。超限直接回 503。
+static CONNECTION_LIMITER: ConnectionLimiter = ConnectionLimiter::new(64);
 
 pub struct AppContext {
     pub config_path: PathBuf,
@@ -165,10 +171,26 @@ pub fn run(
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
+                let Some(slot) = CONNECTION_LIMITER.try_acquire() else {
+                    crate::server::http::reject_overloaded(stream);
+                    continue;
+                };
                 let context = context.clone();
-                std::thread::spawn(move || server::handle_connection(stream, context));
+                let spawned = std::thread::Builder::new()
+                    .name("sentinel-ui-conn".into())
+                    .spawn(move || {
+                        let _slot = slot;
+                        server::handle_connection(stream, context);
+                    });
+                if let Err(error) = spawned {
+                    tracing::warn!(error = %error, "无法创建控制台连接线程");
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
             }
-            Err(error) => tracing::debug!(error = %error, "接受连接失败"),
+            Err(error) => {
+                tracing::debug!(error = %error, "接受连接失败");
+                crate::util::backoff_after_accept_error(&error);
+            }
         }
     }
     Ok(())
@@ -227,32 +249,36 @@ fn linux_pretty_name() -> Option<String> {
 
 #[cfg(target_os = "windows")]
 pub fn open_url(url: &str) -> Result<()> {
-    Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .spawn()
-        .context("无法调用系统浏览器")?;
-    Ok(())
+    spawn_and_reap(Command::new("cmd").args(["/C", "start", "", url])).context("无法调用系统浏览器")
 }
 
 #[cfg(target_os = "macos")]
 pub fn open_url(url: &str) -> Result<()> {
-    Command::new("open")
-        .arg(url)
-        .spawn()
-        .context("无法调用 open")?;
-    Ok(())
+    spawn_and_reap(Command::new("open").arg(url)).context("无法调用 open")
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn open_url(url: &str) -> Result<()> {
-    if Command::new("xdg-open").arg(url).spawn().is_ok() {
+    if spawn_and_reap(Command::new("xdg-open").arg(url)).is_ok() {
         return Ok(());
     }
-    Command::new("gio")
-        .args(["open", url])
-        .spawn()
-        .context("无法调用 xdg-open / gio，请手动在浏览器中打开上面的地址")?;
-    Ok(())
+    spawn_and_reap(Command::new("gio").args(["open", url]))
+        .context("无法调用 xdg-open / gio，请手动在浏览器中打开上面的地址")
+}
+
+/// 启动一个辅助进程并在后台回收。
+///
+/// 只用 `spawn()` 而丢弃 `Child` 不会回收子进程：`open` / `xdg-open` /
+/// `explorer` 很快退出，于是一次点击就留下一个僵尸，直到本进程退出为止。
+fn spawn_and_reap(command: &mut Command) -> Result<()> {
+    let mut child = command.spawn().context("无法启动辅助进程")?;
+    std::thread::Builder::new()
+        .name("sentinel-reaper".into())
+        .spawn(move || {
+            let _ = child.wait();
+        })
+        .map(|_| ())
+        .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 /// Open the folder that contains `path`.
@@ -274,31 +300,18 @@ pub fn reveal(path: &str) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 pub fn open_path(path: &PathBuf) -> Result<()> {
-    Command::new("explorer")
-        .arg(path)
-        .spawn()
-        .context("无法调用资源管理器")?;
-    Ok(())
+    spawn_and_reap(Command::new("explorer").arg(path)).context("无法调用资源管理器")
 }
 
 #[cfg(target_os = "macos")]
 pub fn open_path(path: &PathBuf) -> Result<()> {
-    Command::new("open")
-        .arg(path)
-        .spawn()
-        .context("无法调用 open")?;
-    Ok(())
+    spawn_and_reap(Command::new("open").arg(path)).context("无法调用 open")
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn open_path(path: &PathBuf) -> Result<()> {
-    if Command::new("xdg-open").arg(path).spawn().is_ok() {
+    if spawn_and_reap(Command::new("xdg-open").arg(path)).is_ok() {
         return Ok(());
     }
-    Command::new("gio")
-        .arg("open")
-        .arg(path)
-        .spawn()
-        .context("无法打开文件管理器")?;
-    Ok(())
+    spawn_and_reap(Command::new("gio").arg("open").arg(path)).context("无法打开文件管理器")
 }

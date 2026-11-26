@@ -1,7 +1,77 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use chrono::{Local, TimeZone};
 use sha2::{Digest, Sha256};
+
+/// 简单的并发连接上限。
+///
+/// 服务端每来一个连接就 `thread::spawn` 且没有上限时，连接风暴会耗尽线程
+/// 栈与文件描述符；更糟的是 `thread::spawn` 失败会直接 panic。用这个守卫
+/// 把“同时处理的连接数”钉死，超限时由调用方直接拒绝（drop 连接或回 503）。
+#[derive(Debug)]
+pub struct ConnectionLimiter {
+    active: AtomicUsize,
+    max: usize,
+}
+
+impl ConnectionLimiter {
+    pub const fn new(max: usize) -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            max: if max == 0 { 1 } else { max },
+        }
+    }
+
+    /// 尝试占用一个并发名额；返回的守卫 drop 时自动归还。
+    pub fn try_acquire(&self) -> Option<ConnectionGuard<'_>> {
+        let mut current = self.active.load(Ordering::Acquire);
+        loop {
+            if current >= self.max {
+                return None;
+            }
+            match self.active.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(ConnectionGuard { limiter: self }),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    pub fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+
+    pub fn max(&self) -> usize {
+        self.max
+    }
+}
+
+/// 并发名额守卫：drop 时归还名额。
+#[derive(Debug)]
+pub struct ConnectionGuard<'a> {
+    limiter: &'a ConnectionLimiter,
+}
+
+impl Drop for ConnectionGuard<'_> {
+    fn drop(&mut self) {
+        self.limiter.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// accept / recv 持续失败时的退避，避免 FD 耗尽（EMFILE）后进入 100% CPU 忙等。
+///
+/// `Interrupted`（信号打断）可以立即重试；其余错误通常是持续性的，
+/// 立刻重试只会把 CPU 跑满、同时继续刷日志。
+pub fn backoff_after_accept_error(error: &std::io::Error) {
+    if error.kind() != std::io::ErrorKind::Interrupted {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
 
 /// 读取一行（含末尾 `\n`），但**限制最大字节数**。
 ///
@@ -76,6 +146,49 @@ pub fn format_ts(ts: i64) -> String {
 
 pub fn path_to_key(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+/// 解码 URL 百分号编码。
+///
+/// 必须在**字节**层面判断 `%XX`，不能按 `&str` 切片：URL 里出现
+/// `%` + 多字节字符（`/%中文`）时，`[index + 1..index + 3]` 会切在 UTF-8
+/// 字符中间并 panic。这里只在后两个字节都是 ASCII 十六进制数字时才解码，
+/// 其余情况原样保留 `%`。
+pub fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len()
+                && bytes[index + 1].is_ascii_hexdigit()
+                && bytes[index + 2].is_ascii_hexdigit() =>
+            {
+                let hi = hex_value(bytes[index + 1]);
+                let lo = hex_value(bytes[index + 2]);
+                out.push((hi << 4) | lo);
+                index += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => 0,
+    }
 }
 
 /// Mask a sensitive value so it can be safely stored, logged and displayed.
@@ -335,5 +448,43 @@ mod tests {
         // 上限小 1 应失败。
         let mut reader = BufReader::new(&text[..]);
         assert!(read_line_bounded(&mut reader, &mut buf, 5).is_err());
+    }
+
+    #[test]
+    fn percent_decode_handles_multibyte_after_percent() {
+        // 回归：`/%中` 曾按 &str 切片 panic（切在 UTF-8 字符中间）。
+        // 现在必须原样返回而不是崩溃。
+        assert_eq!(percent_decode("/%中"), "/%中");
+        assert_eq!(percent_decode("%2Ftmp"), "/tmp");
+        assert_eq!(percent_decode("a+b"), "a b");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("%E6%A1%8C%E9%9D%A2"), "桌面");
+        assert_eq!(percent_decode("/%"), "/%");
+    }
+
+    #[test]
+    fn connection_limiter_caps_and_returns_slots() {
+        let limiter = ConnectionLimiter::new(2);
+        let first = limiter.try_acquire().expect("第一个名额");
+        let second = limiter.try_acquire().expect("第二个名额");
+        assert!(limiter.try_acquire().is_none(), "超限必须拒绝");
+        assert_eq!(limiter.active(), 2);
+
+        drop(first);
+        assert_eq!(limiter.active(), 1);
+        // 名额释放后可以再次获取。
+        let third = limiter.try_acquire().expect("释放后应可再获取");
+        assert!(limiter.try_acquire().is_none());
+        drop(second);
+        drop(third);
+        assert_eq!(limiter.active(), 0);
+    }
+
+    #[test]
+    fn connection_limiter_zero_is_treated_as_one() {
+        let limiter = ConnectionLimiter::new(0);
+        assert_eq!(limiter.max(), 1);
+        let _only = limiter.try_acquire().expect("至少允许一个连接");
+        assert!(limiter.try_acquire().is_none());
     }
 }

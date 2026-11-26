@@ -175,3 +175,182 @@ fn default_config_is_valid() {
     assert!(config.discover.enabled);
     assert_eq!(config.discover.service, "_datasentinel._udp.local.");
 }
+
+/// 回归：`GET /%中` 曾让 `percent_decode` 按字节切在 UTF-8 字符中间 panic，
+/// 而 release 构建是 `panic = "abort"`，等于一个请求打挂整个服务端。
+///
+/// 这里直接驱动真实的 `http::handle_connection`，确认畸形 URL 只得到 4xx，
+/// 且进程继续正常工作。
+#[test]
+fn malformed_percent_url_does_not_kill_connection_handler() -> anyhow::Result<()> {
+    use data_sentinel::server::{api, config::ServerConfig, http, store::ServerStore};
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+
+    let dir = tempfile::tempdir()?;
+    let config = Arc::new(ServerConfig {
+        storage: data_sentinel::server::config::ServerStorageConfig {
+            database: dir.path().join("server.db"),
+        },
+        ..ServerConfig::default()
+    });
+    let store = Arc::new(ServerStore::open(&config.database_path())?);
+    let state = Arc::new(data_sentinel::server::AppState {
+        config: Arc::clone(&config),
+        store,
+        auth: Arc::new(data_sentinel::server::AuthState::new(
+            &config,
+            String::new(),
+            "token".to_string(),
+        )),
+        ingest_stats: Arc::new(data_sentinel::server::ingest::IngestStats::default()),
+        started_at: Instant::now(),
+        stopped: Arc::new(AtomicBool::new(false)),
+        config_path: dir.path().join("server.toml"),
+    });
+
+    // 起一个真实监听端口，用原始字节把畸形请求打进去。
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server_state = Arc::clone(&state);
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let state = Arc::clone(&server_state);
+            std::thread::spawn(move || http::handle_connection(stream, state));
+        }
+    });
+
+    let request = |line: &str| -> anyhow::Result<String> {
+        let mut stream = TcpStream::connect(address)?;
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        stream.write_all(line.as_bytes())?;
+        stream.flush()?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        Ok(String::from_utf8_lossy(&response).into_owned())
+    };
+
+    let first = request("GET /%中 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+    assert!(
+        first.starts_with("HTTP/1.1 4") || first.starts_with("HTTP/1.1 200"),
+        "畸形 URL 不应崩溃，实际响应：{first}"
+    );
+
+    // 服务端仍然存活：紧接着的健康检查必须正常返回。
+    let second =
+        request("GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+    assert!(second.contains("200 OK"), "服务端已被打挂：{second}");
+    assert!(second.contains("\"ok\":true"), "{second}");
+
+    let _ = api::JSON;
+    server.join().ok();
+    Ok(())
+}
+
+/// 登录链路回归：输入正确口令后，后续请求必须凭 Cookie 通过鉴权。
+///
+/// 这条链路同时覆盖两个曾经的坑：
+/// 1. `Set-Cookie` 没被浏览器接受 / 没被带回来 → 每个请求都 401，
+///    前端表现就是「输入口令后还是停在登录页」；
+/// 2. Cookie 头里夹带不含 `=` 的片段时解析提前中止，会话丢失。
+#[test]
+fn login_issues_session_cookie_that_authorizes_next_request() -> anyhow::Result<()> {
+    use data_sentinel::server::{api, config::ServerConfig, http, store::ServerStore};
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+
+    const PASSWORD: &str = "test-admin-password";
+
+    let dir = tempfile::tempdir()?;
+    let config = Arc::new(ServerConfig {
+        storage: data_sentinel::server::config::ServerStorageConfig {
+            database: dir.path().join("server.db"),
+        },
+        ..ServerConfig::default()
+    });
+    let store = Arc::new(ServerStore::open(&config.database_path())?);
+    let state = Arc::new(data_sentinel::server::AppState {
+        config: Arc::clone(&config),
+        store,
+        auth: Arc::new(data_sentinel::server::AuthState::new(
+            &config,
+            data_sentinel::server::auth::hash_password(PASSWORD),
+            "agent-token".to_string(),
+        )),
+        ingest_stats: Arc::new(data_sentinel::server::ingest::IngestStats::default()),
+        started_at: Instant::now(),
+        stopped: Arc::new(AtomicBool::new(false)),
+        config_path: dir.path().join("server.toml"),
+    });
+    let _ = api::JSON;
+
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server_state = Arc::clone(&state);
+    let server = std::thread::spawn(move || {
+        // 正好处理下面 3 个请求；accept 次数多于请求数会让 join 永远等不到连接。
+        for _ in 0..3 {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let state = Arc::clone(&server_state);
+            std::thread::spawn(move || http::handle_connection(stream, state));
+        }
+    });
+
+    let request = |raw: &str| -> anyhow::Result<String> {
+        let mut stream = TcpStream::connect(address)?;
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        stream.write_all(raw.as_bytes())?;
+        stream.flush()?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        Ok(String::from_utf8_lossy(&response).into_owned())
+    };
+
+    // 1. 口令正确 → 200 且下发 Cookie。
+    let body = format!(r#"{{"password":"{PASSWORD}"}}"#);
+    let login = request(&format!(
+        "POST /api/login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    ))?;
+    assert!(login.contains("200 OK"), "登录应成功：{login}");
+    let cookie_line = login
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("set-cookie:"))
+        .expect("登录响应必须带 Set-Cookie");
+    assert!(cookie_line.contains("HttpOnly"), "{cookie_line}");
+    assert!(cookie_line.contains("SameSite=Strict"), "{cookie_line}");
+    let session_cookie = cookie_line
+        .split_once("sentinel_session=")
+        .and_then(|(_, rest)| rest.split(';').next())
+        .expect("Cookie 中应有 sentinel_session")
+        .to_string();
+    assert_eq!(session_cookie.len(), 64, "会话令牌应为 32 字节 hex");
+
+    // 2. 带上 Cookie 访问受保护接口 → 200；顺便验证 Cookie 头里有杂项也不影响。
+    let authorized = request(&format!(
+        "GET /api/me HTTP/1.1\r\nHost: localhost\r\nCookie: other=1; sentinel_session={session_cookie}\r\n\
+         Connection: close\r\n\r\n"
+    ))?;
+    assert!(
+        authorized.contains("200 OK"),
+        "会话应通过鉴权：{authorized}"
+    );
+    assert!(authorized.contains("\"actor\":"), "{authorized}");
+
+    // 3. 不存在的会话 → 401，仍然要求登录。
+    let anonymous = request(
+        "GET /api/me HTTP/1.1\r\nHost: localhost\r\nCookie: sentinel_session=bogus\r\n\
+         Connection: close\r\n\r\n",
+    )?;
+    assert!(anonymous.contains("401"), "伪造会话必须被拒绝：{anonymous}");
+
+    server.join().ok();
+    Ok(())
+}

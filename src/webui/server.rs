@@ -18,7 +18,11 @@ const APP_CSS: &str = include_str!("assets/app.css");
 const APP_JS: &str = include_str!("assets/app.js");
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
-const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// 本地控制台的请求体上限（配置编辑等场景，4 MiB 足够）。
+///
+/// 请求体按 `Content-Length` 读取；过大的上限会在“每连接一线程”的场景下
+/// 放大内存占用，因此从 8 MiB 收紧到 4 MiB。
+const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct Request {
     pub method: String,
@@ -161,16 +165,23 @@ fn read_request(stream: &mut TcpStream) -> Result<Option<Request>, String> {
     if content_length > MAX_BODY_BYTES {
         return Err("请求体过大".to_string());
     }
-    let mut body = vec![0u8; content_length];
+    // 不按 Content-Length 无条件预分配：避免“声明 8 MiB 却只发 1 字节”
+    // 的空连接占住整块缓冲区。改为按实际读取量增长。
+    let mut body = Vec::new();
     if content_length > 0 {
+        body.reserve(content_length.min(64 * 1024));
         reader
-            .read_exact(&mut body)
+            .take(content_length as u64)
+            .read_to_end(&mut body)
             .map_err(|error| format!("读取请求体失败: {error}"))?;
+        if body.len() != content_length {
+            return Err("请求体长度与 Content-Length 不一致".to_string());
+        }
     }
 
     Ok(Some(Request {
         method,
-        path: percent_decode(&path),
+        path: crate::util::percent_decode(&path),
         query,
         headers,
         body,
@@ -210,41 +221,12 @@ pub fn parse_query(query: &str) -> HashMap<String, String> {
             Some((key, value)) => (key, value),
             None => (pair, ""),
         };
-        params.insert(percent_decode(raw_key), percent_decode(raw_value));
+        params.insert(
+            crate::util::percent_decode(raw_key),
+            crate::util::percent_decode(raw_value),
+        );
     }
     params
-}
-
-fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut index = 0usize;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'%' if index + 2 < bytes.len() => {
-                let hex = &value[index + 1..index + 3];
-                match u8::from_str_radix(hex, 16) {
-                    Ok(byte) => {
-                        out.push(byte);
-                        index += 3;
-                    }
-                    Err(_) => {
-                        out.push(bytes[index]);
-                        index += 1;
-                    }
-                }
-            }
-            b'+' => {
-                out.push(b' ');
-                index += 1;
-            }
-            byte => {
-                out.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -253,9 +235,9 @@ mod tests {
 
     #[test]
     fn decodes_paths_with_chinese() {
-        assert_eq!(percent_decode("/%E6%A1%8C%E9%9D%A2"), "/桌面");
-        assert_eq!(percent_decode("a+b"), "a b");
-        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(crate::util::percent_decode("/%E6%A1%8C%E9%9D%A2"), "/桌面");
+        assert_eq!(crate::util::percent_decode("a+b"), "a b");
+        assert_eq!(crate::util::percent_decode("%zz"), "%zz");
     }
 
     #[test]
@@ -264,5 +246,14 @@ mod tests {
         assert_eq!(params.get("path").map(String::as_str), Some("/tmp"));
         assert_eq!(params.get("limit").map(String::as_str), Some("20"));
         assert_eq!(params.get("flag").map(String::as_str), Some(""));
+    }
+
+    /// 回归：畸形百分号编码曾按 &str 切片 panic；release 下会 abort 整个进程。
+    #[test]
+    fn malformed_percent_encoding_does_not_panic() {
+        assert_eq!(crate::util::percent_decode("/%中"), "/%中");
+        let params = parse_query("q=%中&x=%");
+        assert_eq!(params.get("q").map(String::as_str), Some("%中"));
+        assert_eq!(params.get("x").map(String::as_str), Some("%"));
     }
 }

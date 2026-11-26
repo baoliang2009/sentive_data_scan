@@ -37,6 +37,10 @@ pub struct SyslogSender {
     transport: Mutex<Transport>,
     /// 当前生效的目标（地址 + 协议）。mDNS 模式下会随发现结果更新。
     target: Mutex<Option<Target>>,
+    /// 串行化“重新发现”，避免多个线程同时创建 mDNS daemon 争抢 5353 端口。
+    ///
+    /// 单独一把锁（而不是复用 target）是为了让发现过程不阻塞已缓存目标的读取。
+    resolve_lock: Mutex<()>,
 }
 
 /// 实际发送目标：把「配置」和「发现结果」解耦。
@@ -76,13 +80,28 @@ impl SyslogSender {
             hostname,
             transport: Mutex::new(Transport::Uninitialized),
             target: Mutex::new(None),
+            resolve_lock: Mutex::new(()),
         })
     }
 
     /// 解析当前应发送到的目标。
     ///
     /// `mdns` 模式优先用发现结果；发现失败时回落到静态 `server`。
+    ///
+    /// 发现是阻塞操作（带超时），多个线程同时发现会各自创建 `ServiceDaemon`
+    /// 争抢 5353 端口。这里用一把专用锁把“重新发现”串行化，锁内只做解析、
+    /// 不持有 `transport`，避免与发送路径互相等待。
     fn resolve_target(&self) -> Option<Target> {
+        if let Ok(guard) = self.target.lock() {
+            if let Some(target) = guard.as_ref() {
+                return Some(target.clone());
+            }
+        }
+        let _resolving = match self.resolve_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // 拿到锁后先复查：可能已有其它线程完成了解析。
         if let Ok(guard) = self.target.lock() {
             if let Some(target) = guard.as_ref() {
                 return Some(target.clone());
@@ -129,12 +148,9 @@ impl SyslogSender {
     }
 
     /// 发现结果变化（例如服务端换机）后重置目标，下次发送重新解析。
-    fn invalidate_target(&self) {
+    fn reset_target(&self) {
         if let Ok(mut guard) = self.target.lock() {
             *guard = None;
-        }
-        if let Ok(mut transport) = self.transport.lock() {
-            *transport = Transport::Uninitialized;
         }
         if self.config.uses_mdns() {
             crate::mdns::global_resolver(
@@ -142,6 +158,17 @@ impl SyslogSender {
                 Duration::from_millis(self.config.mdns_timeout_ms.clamp(500, 30_000)),
             )
             .invalidate();
+        }
+    }
+
+    /// 重置目标与传输层。
+    ///
+    /// 注意：调用方绝不能持有 `self.transport` 锁——`std::sync::Mutex` 不可重入，
+    /// 在持有 `transport` 时再锁一次会自死锁（曾导致 mDNS 外发线程永久卡住）。
+    fn invalidate_target(&self) {
+        self.reset_target();
+        if let Ok(mut transport) = self.transport.lock() {
+            *transport = Transport::Uninitialized;
         }
     }
 
@@ -184,8 +211,11 @@ impl SyslogSender {
                 }
             }
         }
-        if sent == 0 && failed > 0 && self.config.uses_mdns() {
-            // 地址可能已过期（服务端换机/换 IP），下次重新发现。
+        // 地址可能已过期（服务端换机/换 IP），下次重新发现。
+        let should_reinvalidate = sent == 0 && failed > 0 && self.config.uses_mdns();
+        // 必须先释放 transport 锁，再让 invalidate 重新加锁，否则自死锁。
+        drop(transport);
+        if should_reinvalidate {
             self.invalidate_target();
         }
         (sent, failed)
@@ -532,10 +562,26 @@ impl Forwarder {
     }
 
     /// 等待已入队的命中发完（`sentinel scan` 这类短命进程退出前调用）。
+    ///
+    /// 队列满时只告警不阻塞：这个方法的契约是“尽力而为”，调用方（短命进程）
+    /// 马上要退出，无限等待反而会挂住进程。
     pub fn flush(&self, timeout: Duration) {
         let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(1);
-        if self.tx.try_send(Job::Barrier(ack_tx)).is_ok() {
-            let _ = ack_rx.recv_timeout(timeout);
+        match self.tx.try_send(Job::Barrier(ack_tx)) {
+            Ok(()) => {
+                if ack_rx.recv_timeout(timeout).is_err() {
+                    tracing::warn!(
+                        timeout_ms = timeout.as_millis() as u64,
+                        "syslog 外发队列未在超时内排空，可能有报文未送达"
+                    );
+                }
+            }
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                tracing::warn!("syslog 外发队列已满，退出前未能排空全部报文");
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                tracing::warn!("syslog 外发线程已退出，无法刷新队列");
+            }
         }
     }
 
@@ -549,6 +595,17 @@ impl Forwarder {
 }
 
 // ------------------------------------------------------------------ server --
+
+/// 服务端接收器的并发连接上限：每个连接一个线程，不设上限会被连接风暴打穿。
+static SYSLOG_CONNECTION_LIMITER: crate::util::ConnectionLimiter =
+    crate::util::ConnectionLimiter::new(512);
+
+/// accept/recv 持续失败时的退避，避免 FD 耗尽时进入 100% CPU 忙等。
+///
+/// 直接复用 `util` 里的实现，避免三个接收器各写一份、行为不一致。
+fn pause_after_accept_error(error: &std::io::Error) {
+    crate::util::backoff_after_accept_error(error);
+}
 
 /// 服务端接收器：把收到的报文写入本地日志文件并打印到 stdout。
 ///
@@ -643,7 +700,11 @@ impl SyslogServer {
                 Ok((len, peer)) => {
                     self.store(output, &buffer[..len], peer.to_string());
                 }
-                Err(error) => tracing::warn!(error = %error, "接收 UDP 报文失败"),
+                Err(error) => {
+                    tracing::warn!(error = %error, "接收 UDP 报文失败");
+                    // 持续性的错误（例如 FD 耗尽）不应变成 100% CPU 的忙等。
+                    pause_after_accept_error(&error);
+                }
             }
         }
     }
@@ -656,33 +717,55 @@ impl SyslogServer {
                 Ok(stream) => stream,
                 Err(error) => {
                     tracing::warn!(error = %error, "接受 TCP 连接失败");
+                    // 同上：EMFILE 之类会一直失败，必须退避，否则忙等自旋。
+                    pause_after_accept_error(&error);
                     continue;
                 }
             };
+            let Some(_slot) = SYSLOG_CONNECTION_LIMITER.try_acquire() else {
+                // 超过并发上限：直接断开，避免线程/FD 被无限占用。
+                tracing::warn!(
+                    max = SYSLOG_CONNECTION_LIMITER.max(),
+                    "syslog 并发连接数已达上限，拒绝新连接"
+                );
+                drop(stream);
+                continue;
+            };
+            // 没有读写超时的话，一个空闲连接就能永久占住线程和 FD。
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
             let peer = stream
                 .peer_addr()
                 .map(|address| address.to_string())
                 .unwrap_or_else(|_| "unknown".to_string());
             let output = output.to_path_buf();
-            std::thread::spawn(move || {
-                let mut reader = std::io::BufReader::new(stream);
-                let mut line_bytes = Vec::new();
-                // 用带长度上限的读行，避免对端不发换行导致无限缓冲。
-                const MAX_LINE: usize = 1024 * 1024;
-                loop {
-                    match crate::util::read_line_bounded(&mut reader, &mut line_bytes, MAX_LINE) {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            let line = String::from_utf8_lossy(&line_bytes);
-                            store_line(&output, line.trim_end_matches(['\r', '\n']), &peer);
-                        }
-                        Err(error) => {
-                            tracing::debug!(error = %error, "读取 TCP 报文失败");
-                            break;
+            let spawned = std::thread::Builder::new()
+                .name("sentinel-syslog-conn".into())
+                .spawn(move || {
+                    let mut reader = std::io::BufReader::new(stream);
+                    let mut line_bytes = Vec::new();
+                    // 用带长度上限的读行，避免对端不发换行导致无限缓冲。
+                    const MAX_LINE: usize = 1024 * 1024;
+                    loop {
+                        match crate::util::read_line_bounded(&mut reader, &mut line_bytes, MAX_LINE)
+                        {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                let line = String::from_utf8_lossy(&line_bytes);
+                                store_line(&output, line.trim_end_matches(['\r', '\n']), &peer);
+                            }
+                            Err(error) => {
+                                tracing::debug!(error = %error, "读取 TCP 报文失败");
+                                break;
+                            }
                         }
                     }
-                }
-            });
+                });
+            if let Err(error) = spawned {
+                // 线程创建失败（资源耗尽）时不能 panic，也不能死循环。
+                tracing::warn!(error = %error, "无法为 syslog 连接创建处理线程");
+                std::thread::sleep(Duration::from_millis(200));
+            }
         }
         Ok(())
     }
@@ -836,5 +919,36 @@ mod tests {
         let mut cfg = config();
         cfg.server = "   ".to_string();
         assert!(SyslogSender::from_config(&cfg).is_none());
+    }
+
+    /// 回归：mDNS 模式下整批发送失败会调用 `invalidate_target()`。
+    /// 旧实现在持有 `transport` 锁时再次加锁 → `std::sync::Mutex` 自死锁，
+    /// 外发线程永久卡住。这里用超时断言它能在限定时间内返回。
+    #[test]
+    fn mdns_total_failure_does_not_deadlock() {
+        let mut cfg = config();
+        cfg.protocol = "tcp".to_string();
+        cfg.discovery = "mdns".to_string();
+        // 不存在的服务类型 → 发现必然失败，回落到下面这个必连不上的静态地址。
+        cfg.mdns_service = "_no-such-service-ds._udp.local.".to_string();
+        cfg.mdns_timeout_ms = 600;
+        cfg.timeout_ms = 300;
+        cfg.server = "127.0.0.1:1".to_string();
+
+        let sender = SyslogSender::from_config(&cfg).expect("sender");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (sent, failed) = sender.send_findings(Path::new("/tmp/a.txt"), &[finding()]);
+            // 第二次同样会失败并再次触发 invalidate，确认锁没有被永久占住。
+            let (sent2, failed2) = sender.send_findings(Path::new("/tmp/b.txt"), &[finding()]);
+            let _ = tx.send((sent, failed, sent2, failed2));
+        });
+
+        let result = rx.recv_timeout(Duration::from_secs(15));
+        let (sent, failed, sent2, failed2) = result.expect("send_findings 自死锁：15 秒内没有返回");
+        assert_eq!(sent, 0);
+        assert_eq!(failed, 1);
+        assert_eq!(sent2, 0);
+        assert_eq!(failed2, 1);
     }
 }

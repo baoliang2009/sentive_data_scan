@@ -156,12 +156,6 @@ impl Scanner {
         let stats = ScanStats::default();
         let force = force || self.rules_changed();
 
-        let states: Arc<HashMap<String, FileState>> =
-            Arc::new(self.store.file_states().unwrap_or_else(|error| {
-                tracing::warn!(error = %error, "读取扫描台账失败，将退化为全量扫描");
-                HashMap::new()
-            }));
-
         let existing_roots: Vec<PathBuf> = roots
             .iter()
             .filter_map(|root| {
@@ -176,6 +170,17 @@ impl Scanner {
             tracing::warn!("没有可扫描的目录，请检查 scan.roots 配置");
             return stats.finish(started_at);
         }
+
+        // 只加载本次扫描范围下的台账：全量台账在百万级文件时会占用上百 MB，
+        // 而扫描通常只覆盖配置里的几个根目录。
+        let states: Arc<HashMap<String, FileState>> = Arc::new(
+            self.store
+                .file_states_within(Some(&existing_roots))
+                .unwrap_or_else(|error| {
+                    tracing::warn!(error = %error, "读取扫描台账失败，将退化为全量扫描");
+                    HashMap::new()
+                }),
+        );
 
         self.pool.install(|| {
             let iterator = existing_roots.iter().flat_map(|root| self.walk(root));
@@ -349,7 +354,11 @@ impl Scanner {
 
         // Large files are read and decoded entirely; serialize them so the
         // peak memory stays bounded even with many scan threads.
-        let _large_file_guard = if size > 8 * 1024 * 1024 {
+        // Office 文档也必须串行：解压后体积由文件内容决定，一个小压缩包就能
+        // 膨胀到几十 MiB，按“压缩后大小”判断会放过这类内存放大。
+        let heavyweight = size > 8 * 1024 * 1024
+            || crate::detect::is_office_extension(&crate::detect::file_extension(path));
+        let _large_file_guard = if heavyweight {
             self.large_file_lock.lock().ok()
         } else {
             None

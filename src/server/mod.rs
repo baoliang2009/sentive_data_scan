@@ -117,10 +117,18 @@ pub fn run(config_path: Option<PathBuf>) -> Result<()> {
     if config.retention.event_days > 0 {
         let cutoff =
             crate::util::now_ts() - (config.retention.event_days as i64).saturating_mul(86_400);
-        if let Ok(removed) = store.purge_events_before(cutoff) {
-            if removed > 0 {
-                tracing::info!(removed, "已按保留期清理过期告警");
+        match store.purge_old_data(cutoff, RETAIN_RULE_REVISIONS) {
+            Ok(report) if report.total() > 0 => {
+                tracing::info!(
+                    events = report.events,
+                    audit = report.audit,
+                    rule_sets = report.rule_sets,
+                    agents = report.agents,
+                    "已按保留期清理过期数据"
+                );
             }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(error = %error, "按保留期清理失败"),
         }
     }
 
@@ -165,21 +173,69 @@ pub fn run(config_path: Option<PathBuf>) -> Result<()> {
 
     start_retention_worker(Arc::clone(&state));
 
-    for incoming in listener.incoming() {
-        match incoming {
-            Ok(stream) => {
-                let state = Arc::clone(&state);
-                let tls = tls.clone();
-                std::thread::spawn(move || match tls {
-                    Some(tls) => http::handle_tls_connection(stream, state, tls),
-                    None => http::handle_connection(stream, state),
-                });
-            }
-            Err(error) => tracing::debug!(error = %error, "接受连接失败"),
+    // 优雅退出：Ctrl-C / SIGTERM 时置位 stopped，让保留期线程退出，
+    // 并让 mDNS 广播在进程结束前发出 goodbye 包。
+    {
+        let stopped = Arc::clone(&state.stopped);
+        if let Err(error) = ctrlc::set_handler(move || {
+            stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!("收到退出信号，服务端正在停止");
+        }) {
+            tracing::warn!(error = %error, "注册退出信号处理器失败");
         }
     }
+
+    // 非阻塞 accept + 短轮询，才能在每个循环里看到 stopped 标志。
+    // 直接 `for incoming in listener.incoming()` 会一直阻塞在 accept 上，
+    // 装了信号处理器之后 Ctrl-C 会“看起来没反应”。
+    if let Err(error) = listener.set_nonblocking(true) {
+        tracing::warn!(error = %error, "无法将监听套接字设为非阻塞，退出信号可能延迟生效");
+    }
+
+    while !state.stopped.load(std::sync::atomic::Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                let _ = stream.set_nonblocking(false);
+                let Some(slot) = CONNECTION_LIMITER.try_acquire() else {
+                    // 已建立的控制台连接：回 503 比直接 RST 更友好。
+                    crate::server::http::reject_overloaded(stream);
+                    continue;
+                };
+                let state = Arc::clone(&state);
+                let tls = tls.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("sentinel-server-conn".into())
+                    .spawn(move || {
+                        let _slot = slot;
+                        match tls {
+                            Some(tls) => http::handle_tls_connection(stream, state, tls),
+                            None => http::handle_connection(stream, state),
+                        }
+                    });
+                if let Err(error) = spawned {
+                    tracing::warn!(error = %error, "无法创建控制台连接线程");
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => {
+                tracing::debug!(error = %error, "接受连接失败");
+                crate::util::backoff_after_accept_error(&error);
+            }
+        }
+    }
+    tracing::info!("服务端已停止");
     Ok(())
 }
+
+/// 保留的规则版本数量：足够覆盖回滚窗口，又不会让 `rule_sets` 无限增长。
+const RETAIN_RULE_REVISIONS: usize = 50;
+
+/// 控制台并发连接上限：每连接一个线程，不设上限会被连接风暴打穿。
+static CONNECTION_LIMITER: crate::util::ConnectionLimiter =
+    crate::util::ConnectionLimiter::new(256);
 
 /// 按配置注册 mDNS 广播，失败只告警——发现是便利功能，不能阻断服务启动。
 fn start_advertiser(config: &ServerConfig) -> Option<crate::mdns::Advertiser> {
@@ -296,10 +352,18 @@ fn start_retention_worker(state: Arc<AppState>) {
             }
             let cutoff = crate::util::now_ts()
                 - (state.config.retention.event_days as i64).saturating_mul(86_400);
-            if let Ok(removed) = state.store.purge_events_before(cutoff) {
-                if removed > 0 {
-                    tracing::info!(removed, "已清理过期告警");
+            match state.store.purge_old_data(cutoff, RETAIN_RULE_REVISIONS) {
+                Ok(report) if report.total() > 0 => {
+                    tracing::info!(
+                        events = report.events,
+                        audit = report.audit,
+                        rule_sets = report.rule_sets,
+                        agents = report.agents,
+                        "已按保留期清理过期数据"
+                    );
                 }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(error = %error, "按保留期清理失败"),
             }
         })
         .ok();

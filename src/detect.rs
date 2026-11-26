@@ -10,7 +10,18 @@ use crate::model::Finding;
 use crate::rules::RuleSet;
 use crate::util::sha256_hex;
 
-const MAX_OFFICE_UNCOMPRESSED: u64 = 256 * 1024 * 1024;
+/// Office 压缩包解压后的总字节上限。
+///
+/// 原来是 256 MiB，配合“大文件锁只看压缩后大小”会让一个 8 MiB 的 docx
+/// 膨胀到数百 MiB；多个扫描线程同时处理即可 OOM。这里压到 64 MiB，
+/// 同时 `scan.rs` 会把 Office 文件也纳入大文件串行路径。
+const MAX_OFFICE_UNCOMPRESSED: u64 = 64 * 1024 * 1024;
+
+/// 抽取出的纯文本上限（字节）。超过后停止追加，避免 `text` 无界增长。
+const MAX_OFFICE_TEXT_BYTES: usize = 32 * 1024 * 1024;
+
+/// 单个 zip 条目一次性读取的上限；超过部分直接丢弃。
+const MAX_OFFICE_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 
 pub struct Detector {
     rules: RuleSet,
@@ -109,6 +120,9 @@ impl Detector {
         let mut total = 0u64;
 
         for index in 0..archive.len() {
+            if text.len() >= MAX_OFFICE_TEXT_BYTES {
+                break;
+            }
             let mut entry = archive
                 .by_index(index)
                 .with_context(|| format!("无法读取 Office 内部条目 {}", path.display()))?;
@@ -119,12 +133,17 @@ impl Detector {
             if !is_office_content(&name, extension) {
                 continue;
             }
+            // `entry.size()` 来自压缩包头，完全由文件内容控制，只能当“上限提示”
+            // 用；真正的读取量必须被 remaining 夹住。
             let size = entry.size();
             if total.saturating_add(size) > MAX_OFFICE_UNCOMPRESSED {
                 return Ok(ExtractOutcome::Skip("Office 解压体积超过上限"));
             }
-            let remaining = MAX_OFFICE_UNCOMPRESSED.saturating_sub(total);
-            let mut data = Vec::with_capacity(size.min(8 * 1024 * 1024) as usize);
+            let remaining = MAX_OFFICE_UNCOMPRESSED
+                .saturating_sub(total)
+                .min(MAX_OFFICE_ENTRY_BYTES);
+            // 预分配用“实际将被读取的量”，而不是压缩包头声明的大小。
+            let mut data = Vec::with_capacity(size.min(remaining).min(8 * 1024 * 1024) as usize);
             entry
                 .by_ref()
                 .take(remaining)
@@ -136,9 +155,10 @@ impl Detector {
             if !text.ends_with('\n') {
                 text.push('\n');
             }
-            if text.len() > 128 * 1024 * 1024 {
-                break;
-            }
+        }
+        if text.len() > MAX_OFFICE_TEXT_BYTES {
+            let cut = crate::util::floor_char_boundary(&text, MAX_OFFICE_TEXT_BYTES);
+            text.truncate(cut);
         }
 
         if text.trim().is_empty() {

@@ -650,6 +650,48 @@ pub fn secure_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 日志保留天数（滚动日志按天切分，旧文件需要主动删除）。
+pub const LOG_RETENTION_DAYS: u64 = 14;
+
+/// 清理超过保留天数的滚动日志。
+///
+/// `tracing_appender::rolling::daily` 只负责按天切分，**不会删除旧文件**；
+/// 常驻守护进程跑上几个月，`logs/` 会一直变大。启动时清一次，守护进程
+/// 每天再清一次，足够把日志量收敛住。
+pub fn prune_old_logs(dir: &Path, keep_days: u64) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let max_age = std::time::Duration::from_secs(keep_days.saturating_mul(86_400));
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|name| name.to_str()) {
+            Some(name) => name,
+            None => continue,
+        };
+        if !name.starts_with("sentinel.log") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let expired = now
+            .duration_since(modified)
+            .map(|age| age > max_age)
+            .unwrap_or(false);
+        if expired {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
 pub fn expand_path(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     if text == "~" {

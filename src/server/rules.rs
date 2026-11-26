@@ -414,4 +414,65 @@ mod tests {
         let status = store.rule_sync_status().unwrap();
         assert_eq!(status["latest_revision"], doc.revision);
     }
+
+    /// 保留期清理必须同时收敛 events / audit / rule_sets / agents，
+    /// 否则服务端长期运行后数据库只增不减。
+    #[test]
+    fn purge_old_data_prunes_every_growing_table() {
+        use super::super::store::{IncomingBatch, IncomingFinding};
+        let dir = tempfile::tempdir().unwrap();
+        let store = ServerStore::open(&dir.path().join("srv.db")).unwrap();
+
+        // 生成 5 个规则版本。
+        for index in 0..5 {
+            let mut rules = RulesConfig::default();
+            rules.custom.push(CustomRuleConfig {
+                id: format!("r{index}"),
+                pattern: r"EMP-\d{6}".to_string(),
+                ..CustomRuleConfig::default()
+            });
+            store.publish_rules(rules, "v", "admin", false).unwrap();
+        }
+
+        // 一条告警 + 一台终端。
+        let batch = IncomingBatch {
+            agent_id: "agent-1".to_string(),
+            hostname: "pc01".to_string(),
+            username: "alice".to_string(),
+            platform: "linux".to_string(),
+            version: "0.2.2".to_string(),
+            rule_revision: 1,
+            findings: vec![IncomingFinding {
+                rule_id: "cn_mobile".to_string(),
+                rule_name: "手机".to_string(),
+                category: "contact".to_string(),
+                severity: "high".to_string(),
+                masked: "138********5678".to_string(),
+                path: "/tmp/a.txt".to_string(),
+                line: 1,
+                column: 1,
+                snippet: String::new(),
+                match_hash: "h".to_string(),
+                time: String::new(),
+            }],
+        };
+        store.ingest(&batch, "127.0.0.1").unwrap();
+
+        // 用一个“未来”的截止时间把全部数据都判为过期。
+        let cutoff = crate::util::now_ts() + 86_400;
+        let report = store.purge_old_data(cutoff, 2).unwrap();
+        assert_eq!(report.events, 1);
+        assert_eq!(report.agents, 1);
+        // 5 个版本只保留 2 个。
+        assert_eq!(report.rule_sets, 3);
+        assert!(report.audit >= 1);
+
+        assert!(store
+            .events(&crate::server::store::EventFilter::default())
+            .unwrap()
+            .0
+            .is_empty());
+        assert!(store.agents().unwrap().is_empty());
+        assert_eq!(store.rules_history(100).unwrap().len(), 2);
+    }
 }

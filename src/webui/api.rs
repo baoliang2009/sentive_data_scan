@@ -528,7 +528,6 @@ fn start_scan(ctx: &AppContext, request: &Request) -> Response {
         })
         .unwrap_or_default();
     let force = body.get("force").and_then(Value::as_bool).unwrap_or(false);
-    let notify = body.get("notify").and_then(Value::as_bool).unwrap_or(true);
 
     ctx.scan.progress.reset();
     ctx.scan.started_at.store(now_ts(), Ordering::SeqCst);
@@ -542,42 +541,45 @@ fn start_scan(ctx: &AppContext, request: &Request) -> Response {
 
     let session = Arc::clone(&ctx.scan);
     let config_path = ctx.config_path.clone();
-    std::thread::spawn(move || {
-        let started = Instant::now();
-        let started_at = now_ts();
-        let outcome = run_scan_batch(
-            &config_path,
-            &requested,
-            force,
-            notify,
-            Arc::clone(&session),
-        );
-        let finished_at = now_ts();
-        match outcome {
-            Ok((roots, summary)) => {
-                let result = ScanResult {
-                    started_at,
-                    finished_at,
-                    duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-                    roots: roots.clone(),
-                    summary,
-                };
-                if let Ok(mut slot) = session.last.lock() {
-                    *slot = Some(result);
+    let worker = Arc::clone(&session);
+    let spawned = std::thread::Builder::new()
+        .name("sentinel-ui-scan".into())
+        .spawn(move || {
+            let started = Instant::now();
+            let started_at = now_ts();
+            let outcome = run_scan_batch(&config_path, &requested, force, Arc::clone(&worker));
+            let finished_at = now_ts();
+            match outcome {
+                Ok((roots, summary)) => {
+                    let result = ScanResult {
+                        started_at,
+                        finished_at,
+                        duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        roots: roots.clone(),
+                        summary,
+                    };
+                    if let Ok(mut slot) = worker.last.lock() {
+                        *slot = Some(result);
+                    }
+                    if let Ok(mut slot) = worker.roots.lock() {
+                        *slot = roots;
+                    }
                 }
-                if let Ok(mut slot) = session.roots.lock() {
-                    *slot = roots;
-                }
-            }
-            Err(error) => {
-                if let Ok(mut slot) = session.error.lock() {
-                    *slot = Some(format!("{error:#}"));
+                Err(error) => {
+                    if let Ok(mut slot) = worker.error.lock() {
+                        *slot = Some(format!("{error:#}"));
+                    }
                 }
             }
-        }
-        session.progress.mark_finished();
+            worker.progress.mark_finished();
+            worker.running.store(false, Ordering::SeqCst);
+        });
+    if let Err(error) = spawned {
+        // 线程创建失败时必须回滚 running，否则控制台会永远显示“扫描中”。
         session.running.store(false, Ordering::SeqCst);
-    });
+        session.progress.mark_finished();
+        return fail(anyhow::anyhow!(error).context("无法启动扫描线程"));
+    }
 
     ok(json!({ "ok": true }))
 }
@@ -586,7 +588,6 @@ fn run_scan_batch(
     config_path: &Path,
     requested: &[String],
     force: bool,
-    notify: bool,
     session: Arc<crate::webui::ScanSession>,
 ) -> Result<(Vec<String>, Value)> {
     let (config, _path) = Config::load(Some(config_path))?;
@@ -614,9 +615,6 @@ fn run_scan_batch(
     }
 
     let summary = scanner.scan_roots(&roots, force);
-    if notify {
-        Notifier::new(&config.notify).notify_scan(&summary);
-    }
     let value = serde_json::to_value(&summary).context("序列化扫描结果失败")?;
     let labels: Vec<String> = roots
         .iter()

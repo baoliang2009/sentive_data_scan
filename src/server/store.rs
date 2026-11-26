@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, Row, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 use crate::config::ensure_private_dir;
@@ -649,6 +649,80 @@ impl ServerStore {
     pub fn purge_events_before(&self, ts: i64) -> Result<usize> {
         let conn = self.conn()?;
         Ok(conn.execute("DELETE FROM events WHERE received_at < ?1", params![ts])?)
+    }
+
+    /// 按保留期清理所有会持续增长的表。
+    ///
+    /// 原来只删 `events`，但 `audit_log`、`rule_sets` 与长期离线的 `agents`
+    /// 会一直累积 —— 服务端跑一年后数据库体积几乎只增不减。这里统一清理：
+    /// - `events` / `audit_log`：按时间保留；
+    /// - `rule_sets`：保留最近 `keep_rule_revisions` 个版本（回滚窗口）；
+    /// - `agents`：超过保留期仍未上报的终端（连同其规则状态）。
+    pub fn purge_old_data(
+        &self,
+        cutoff_ts: i64,
+        keep_rule_revisions: usize,
+    ) -> Result<PurgeReport> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let events = tx.execute(
+            "DELETE FROM events WHERE received_at < ?1",
+            params![cutoff_ts],
+        )?;
+        let audit = tx.execute("DELETE FROM audit_log WHERE at < ?1", params![cutoff_ts])?;
+
+        // 保留最近 N 个规则版本：找出“最老的保留版本”，删除更旧的。
+        // OFFSET 取 keep-1（第 N 新），否则会少删一个、实际多保留一版。
+        let keep = keep_rule_revisions.max(1) as i64;
+        let boundary: Option<i64> = tx
+            .query_row(
+                "SELECT revision FROM rule_sets ORDER BY revision DESC LIMIT 1 OFFSET ?1",
+                params![keep - 1],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let rule_sets = match boundary {
+            Some(boundary) => tx.execute(
+                "DELETE FROM rule_sets WHERE revision < ?1",
+                params![boundary],
+            )?,
+            None => 0,
+        };
+
+        let agents = tx.execute(
+            "DELETE FROM agents WHERE last_seen < ?1",
+            params![cutoff_ts],
+        )?;
+        if agents > 0 {
+            tx.execute(
+                "DELETE FROM agent_rule_state WHERE agent_id NOT IN (SELECT id FROM agents)",
+                [],
+            )?;
+        }
+        tx.commit()?;
+
+        Ok(PurgeReport {
+            events,
+            audit,
+            rule_sets,
+            agents,
+        })
+    }
+}
+
+/// 一次保留期清理的结果。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PurgeReport {
+    pub events: usize,
+    pub audit: usize,
+    pub rule_sets: usize,
+    pub agents: usize,
+}
+
+impl PurgeReport {
+    pub fn total(&self) -> usize {
+        self.events + self.audit + self.rule_sets + self.agents
     }
 }
 

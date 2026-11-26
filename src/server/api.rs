@@ -40,10 +40,17 @@ fn fail(error: anyhow::Error) -> (u16, &'static str, Vec<u8>) {
 ///
 /// 返回 `(响应, Set-Cookie)`。Cookie 设为 `HttpOnly` + `SameSite=Strict`，
 /// 避免被前端脚本读取或被跨站请求携带。
+///
+/// 连续失败会按来源 IP 限流：`LoginThrottle` 记录了失败次数，但必须在这里
+/// 真正读取它，否则“锁定”形同虚设，口令仍可被无限爆破。
 pub fn login(
     auth: &AuthState,
     request: &Request,
 ) -> ((u16, &'static str, Vec<u8>), Option<String>) {
+    if auth.locked(&request.remote) {
+        tracing::warn!(remote = %request.remote, "登录失败次数过多，已临时锁定");
+        return (error_response(429, "失败次数过多，请稍后再试"), None);
+    }
     let body = match request.json() {
         Ok(body) => body,
         Err(error) => return (error_response(400, error), None),
@@ -310,14 +317,27 @@ pub fn handle(request: &Request, state: &AppState, actor: &str) -> (u16, &'stati
                 return error_response(400, "days 必须大于 0");
             }
             let cutoff = crate::util::now_ts() - days.saturating_mul(86_400);
-            match state.store.purge_events_before(cutoff) {
-                Ok(removed) => {
+            match state
+                .store
+                .purge_old_data(cutoff, super::RETAIN_RULE_REVISIONS)
+            {
+                Ok(report) => {
                     let _ = state.store.record_audit(
                         actor,
                         "purge_events",
-                        &format!("days={days} removed={removed}"),
+                        &format!(
+                            "days={days} events={} audit={} agents={} rule_sets={}",
+                            report.events, report.audit, report.agents, report.rule_sets
+                        ),
                     );
-                    ok(json!({ "ok": true, "removed": removed }))
+                    ok(json!({
+                        "ok": true,
+                        "removed": report.total(),
+                        "events": report.events,
+                        "audit": report.audit,
+                        "agents": report.agents,
+                        "rule_sets": report.rule_sets,
+                    }))
                 }
                 Err(error) => fail(error),
             }
@@ -357,6 +377,12 @@ fn filter_from_query(params: &std::collections::HashMap<String, String>) -> Even
     }
 }
 
+/// 登录失败限流表的上限，按来源 IP 计。
+///
+/// 5 分钟窗口内最多保留这么多来源；不设上限时，攻击者伪造大量来源
+/// （或 IPv6 地址轮换）就能让这张内存表无限增长。
+const MAX_THROTTLE_ENTRIES: usize = 4096;
+
 /// 登录失败限流状态（简单的内存计数，够防暴力破解）。
 pub struct LoginThrottle {
     entries: std::sync::Mutex<std::collections::HashMap<String, (u32, Instant)>>,
@@ -370,10 +396,22 @@ impl LoginThrottle {
     }
 
     /// 记录一次失败；同一来源 1 分钟内超过 5 次就锁 5 分钟。
+    ///
+    /// 表大小有硬上限：攻击者用大量不同来源刷登录时，不能让它无界增长。
     pub fn record_failure(&self, remote: &str) {
         if let Ok(mut map) = self.entries.lock() {
             let now = Instant::now();
             map.retain(|_, (_, at)| now.duration_since(*at) < std::time::Duration::from_secs(300));
+            if map.len() >= MAX_THROTTLE_ENTRIES {
+                // 已经满了：优先淘汰最早的记录，保证新来源仍能被限流。
+                if let Some(oldest) = map
+                    .iter()
+                    .min_by_key(|(_, (_, at))| *at)
+                    .map(|(key, _)| key.clone())
+                {
+                    map.remove(&oldest);
+                }
+            }
             let entry = map.entry(remote.to_string()).or_insert((0, now));
             entry.0 += 1;
             entry.1 = now;
@@ -434,5 +472,63 @@ mod tests {
         assert!(!throttle.is_locked("5.6.7.8"));
         throttle.clear("1.2.3.4");
         assert!(!throttle.is_locked("1.2.3.4"));
+    }
+
+    /// 大量不同来源刷登录时，限流表必须有界，不能被撑爆内存。
+    #[test]
+    fn throttle_table_is_bounded() {
+        let throttle = LoginThrottle::new();
+        for index in 0..(MAX_THROTTLE_ENTRIES + 500) {
+            throttle.record_failure(&format!("10.0.{}.{}", index / 256, index % 256));
+        }
+        let entries = throttle.entries.lock().unwrap().len();
+        assert!(
+            entries <= MAX_THROTTLE_ENTRIES,
+            "限流表应保持有界，实际 {entries}"
+        );
+        // 最新的来源仍然会被正常记录/限流。
+        for _ in 0..5 {
+            throttle.record_failure("192.168.1.9");
+        }
+        assert!(throttle.is_locked("192.168.1.9"));
+    }
+
+    /// 限流必须真的作用在登录入口上：锁定后即使口令正确也应被拒绝。
+    #[test]
+    fn login_is_blocked_after_too_many_failures() {
+        use crate::server::config::ServerConfig;
+        use crate::server::http::Request;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = ServerConfig {
+            storage: crate::server::config::ServerStorageConfig {
+                database: dir.path().join("srv.db"),
+            },
+            ..ServerConfig::default()
+        };
+        let hash = crate::server::auth::hash_password("correct-password");
+        let auth = AuthState::new(&config, hash, "token".to_string());
+
+        let bad = Request {
+            method: "POST".to_string(),
+            path: "/api/login".to_string(),
+            query: String::new(),
+            headers: std::collections::HashMap::new(),
+            body: br#"{"password":"wrong"}"#.to_vec(),
+            remote: "203.0.113.7".to_string(),
+        };
+        for _ in 0..5 {
+            let (response, cookie) = login(&auth, &bad);
+            assert_eq!(response.0, 401, "前 5 次应是口令错误");
+            assert!(cookie.is_none());
+        }
+
+        let good = Request {
+            body: br#"{"password":"correct-password"}"#.to_vec(),
+            ..bad
+        };
+        let (response, cookie) = login(&auth, &good);
+        assert_eq!(response.0, 429, "锁定后即使口令正确也应被限流");
+        assert!(cookie.is_none());
     }
 }

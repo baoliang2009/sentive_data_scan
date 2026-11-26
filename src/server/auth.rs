@@ -42,6 +42,11 @@ pub fn verify_password(password: &str, stored: &str) -> bool {
     let (Ok(salt), Ok(expected)) = (hex::decode(salt_hex), hex::decode(key_hex)) else {
         return false;
     };
+    // 空盐/空 key 必须拒绝：否则 `pbkdf2$1$aa$` 这类被截断的配置会让
+    // 任意口令都算出长度为 0 的摘要，比较结果恒为真。
+    if salt.is_empty() || expected.is_empty() {
+        return false;
+    }
     let actual = pbkdf2(password.as_bytes(), &salt, iterations, expected.len());
     // 定长比较，避免按字节短路带来的时序差异。
     actual.len() == expected.len()
@@ -211,6 +216,22 @@ mod tests {
         assert!(!verify_password("x", "bcrypt$1$aa$bb"));
         assert!(!verify_password("x", "pbkdf2$notanumber$aa$bb"));
         assert!(!verify_password("x", "pbkdf2$10$zz$bb"));
+    }
+
+    /// 回归：空盐 / 空 key 曾让任意口令通过（摘要长度 0 == 0）。
+    #[test]
+    fn rejects_truncated_records() {
+        for record in [
+            "pbkdf2$10$aa$",
+            "pbkdf2$10$$bb",
+            "pbkdf2$10$$",
+            "pbkdf2$10$aa",
+        ] {
+            assert!(
+                !verify_password("anything", record),
+                "截断的口令记录不应通过: {record}"
+            );
+        }
     }
 
     #[test]
